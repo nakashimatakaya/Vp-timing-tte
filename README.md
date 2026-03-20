@@ -76,6 +76,3 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE) for detai
 Takaya Nakashima  
 Department of Anesthesiology and Intensive Care Medicine, Nagasaki University  
 Email: bb55322029@ms.nagasaki-u.ac.jp
-# -vp-timing-tte
-# -vp-timing-tte
-# Vp-timing-tte

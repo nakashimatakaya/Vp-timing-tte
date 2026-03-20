@@ -1,0 +1,1433 @@
+---
+title: "Ultra-early versus early adjunctive vasopressin initiation after norepinephrine escalation in septic shock: Steroid-adjusted analysis"
+author: "Takaya Nakashima"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.width  = 10,
+  fig.height = 7,
+  dpi        = 300,
+  cache      = TRUE
+)
+```
+
+```{r libraries}
+library(tidyverse)
+library(survival)
+library(scales)
+library(patchwork)
+library(officer)
+library(rvg)
+library(flextable)
+library(gtsummary)
+library(survey)
+library(splines)
+library(Gmisc)
+library(grid)
+```
+
+# Parameters and paths
+
+```{r params}
+DAY28_HR      <- 28 * 24
+EARLY_END     <- 6
+P_CLIP        <- 1e-6
+SEED          <- 20260319
+B_BOOT        <- 500
+
+PPTX_PATH <- "/Users/nakashimatakaya/Desktop/SID/Outcome/VP_steroid_adjusted_figures.pptx"
+DOCX_TABLE1 <- "/Users/nakashimatakaya/Desktop/SID/Outcome/VP_steroid_table1.docx"
+DOCX_STBL5  <- "/Users/nakashimatakaya/Desktop/SID/Outcome/VP_steroid_stable5.docx"
+DOCX_STBL7  <- "/Users/nakashimatakaya/Desktop/SID/Outcome/VP_steroid_stable7.docx"
+
+COL_ULTRA <- "#E24B4A"
+COL_EARLY <- "#185FA5"
+```
+
+# データの読み込み
+```{r}
+# 利用可能ソースの確認
+src_data_avail()
+
+# 使うソース（あなたの環境でTRUEのものだけattachしてください）
+attach_src("miiv")
+attach_src("eicu")
+
+# write_rds(sens_results, "/Users/nakashimatakaya/Desktop/SID/Data/Analysis_Data_20260320/sens_results.rds")
+# write_rds(ts_out, "/Users/nakashimatakaya/Desktop/SID/Data/Analysis_Data_20260320/ts_out")
+# write_rds(pt_vp6, "/Users/nakashimatakaya/Desktop/SID/Data/Analysis_Data_20260320/pt_vp6")
+
+
+OUT_DIR <- "/Users/nakashimatakaya/Desktop/SID/Outcome"
+fs::dir_create(OUT_DIR)
+
+# ---- 入力ファイル ----
+IN_TS_OUT  <- "/Users/nakashimatakaya/Desktop/SID/Data/Analysis_Data/vp_ts_out_secondary_20260223.rds"
+IN_PT_VP6  <- "/Users/nakashimatakaya/Desktop/SID/Data/Analysis_Data/vp_pt_vp6_20260224.rds"
+IN_CCW_TBL <- "/Users/nakashimatakaya/Desktop/SID/Data/Analysis_Data/vp_ccw_tbl_20260224.rds"
+IN_TS_IMPUTED <- "/Users/nakashimatakaya/Desktop/SID/Data/Analysis_Data/septic_shock_imputed_df_new"
+IN_SENS_RESULTS <- "/Users/nakashimatakaya/Desktop/SID/Data/Analysis_Data/cache_vp_secondary_20260223/sens_results_selfcontained.rds"
+
+# ---- 出力ファイル ----
+OUT_MAIN_TABLES <- file.path(OUT_DIR, "VP_main_tables.docx")
+OUT_SUPP_TABLES <- file.path(OUT_DIR, "VP_supplementary_tables.docx")
+OUT_MAIN_FIGS   <- file.path(OUT_DIR, "VP_main_figures.pptx")
+OUT_SUPP_FIGS   <- file.path(OUT_DIR, "VP_supplementary_figures.pptx")
+
+DAY28_HR <- 28 * 24
+RUN_BOOTSTRAP_RD_RMST <- FALSE
+B_BOOT <- 500
+SEED_BOOT <- 20260228
+
+stopifnot(file.exists(IN_TS_OUT), file.exists(IN_PT_VP6), file.exists(IN_CCW_TBL))
+
+ts_out  <- readr::read_rds(IN_TS_OUT)
+pt_vp6  <- readr::read_rds(IN_PT_VP6)
+ccw_tbl <- readr::read_rds(IN_CCW_TBL)
+```
+
+# Steroid exposure extraction
+
+## MIMIC-IV and eICU-CRD steroid events
+
+```{r steroid-extraction}
+# =========================================================
+# 0) pt_vp6 preparation
+# =========================================================
+pt_base <- pt_vp6 %>%
+  ungroup() %>%
+  mutate(
+    row_id = row_number(),
+    src_std = case_when(
+      str_detect(str_to_lower(as.character(src)), "miiv|mimic") ~ "miiv",
+      str_detect(str_to_lower(as.character(src)), "eicu") ~ "eicu",
+      TRUE ~ str_to_lower(as.character(src))
+    ),
+    all_id_chr = as.character(all_id),
+    t0_hr = as.numeric(t0_hr),
+    can_eval = !is.na(all_id_chr) & !is.na(t0_hr) & src_std %in% c("miiv", "eicu")
+  )
+
+pt_ref <- pt_base %>%
+  filter(can_eval) %>%
+  transmute(row_id, src_std, all_id = all_id_chr, t0_hr)
+
+# =========================================================
+# 1) Target IDs
+# =========================================================
+target_ids_mimic <- miiv$icustays %>%
+  as_tibble() %>%
+  semi_join(
+    pt_ref %>%
+      filter(src_std == "miiv") %>%
+      transmute(stay_id = as.integer(all_id)) %>%
+      distinct(),
+    by = "stay_id"
+  ) %>%
+  transmute(
+    all_id    = as.character(subject_id),
+    pt_all_id = as.character(stay_id),
+    subject_id, hadm_id, stay_id, intime
+  ) %>%
+  distinct()
+
+target_ids_eicu <- pt_ref %>%
+  filter(src_std == "eicu") %>%
+  distinct(all_id) %>%
+  filter(!is.na(all_id)) %>%
+  mutate(pt_all_id = all_id)
+
+# =========================================================
+# 2) Drug pattern helpers
+# =========================================================
+steroid_pat <- regex(
+  paste(c(
+    "hydrocortisone", "solu[- ]?cortef",
+    "methylpred", "methylprednisolone", "solu[- ]?medrol",
+    "prednisone", "prednisolone",
+    "dexameth", "dexamethasone", "decadron",
+    "betameth", "betamethasone",
+    "triamcinolone", "fludrocortisone", "cortisone"
+  ), collapse = "|"),
+  ignore_case = TRUE
+)
+
+nonsystemic_pat <- regex(
+
+  paste(c(
+    "TOPIC", "TOPICAL", "OPH", "OPHTH", "EYE",
+    "OTIC", "EAR", "NASAL", "INHAL", "NEB",
+    "SPRAY", "DROP", "CREAM", "OINT", "LOTION",
+    "GEL", "FOAM", "VAGIN", "RECTAL", "ENEMA"
+  ), collapse = "|"),
+  ignore_case = TRUE
+)
+
+keep_systemic <- function(drug_txt = NA_character_, route_txt = NA_character_) {
+  txt <- str_squish(str_to_upper(
+    paste(coalesce(as.character(drug_txt), ""),
+          coalesce(as.character(route_txt), ""))
+  ))
+  txt == "" | !str_detect(txt, nonsystemic_pat)
+}
+
+is_admin_status <- function(x) {
+  z <- str_squish(str_to_upper(coalesce(as.character(x), "")))
+  z != "" &
+    !str_detect(z, "NOT GIVEN|NOT ADMIN|REFUS|HOLD|MISS|DELAY|CANCEL|REMOVE|STOP|RETURN") &
+    str_detect(z, "ADMIN|APPL|CONFIRM|GIVEN|BOLUS")
+}
+
+# =========================================================
+# 3) MIMIC-IV steroid events
+# =========================================================
+mimic_steroid_emar <- miiv$emar %>%
+  as_tibble() %>%
+  semi_join(
+    target_ids_mimic %>% select(subject_id, hadm_id) %>% distinct(),
+    by = c("subject_id", "hadm_id"), copy = TRUE
+  ) %>%
+  select(subject_id, hadm_id, emar_id, charttime, medication, event_txt) %>%
+  inner_join(
+    miiv$emar_detail %>% as_tibble() %>% select(emar_id, product_description),
+    by = "emar_id"
+  ) %>%
+  collect() %>%
+  inner_join(
+    target_ids_mimic %>% select(subject_id, hadm_id, pt_all_id, stay_id, intime),
+    by = c("subject_id", "hadm_id")
+  ) %>%
+  mutate(
+    drug_txt = str_squish(paste(coalesce(product_description, ""), coalesce(medication, ""))),
+    event_offset_hr = as.numeric(difftime(charttime, intime, units = "hours"))
+  ) %>%
+  filter(
+    str_detect(drug_txt, steroid_pat),
+    keep_systemic(drug_txt),
+    is_admin_status(event_txt),
+    !is.na(event_offset_hr)
+  ) %>%
+  transmute(
+    src_std = "miiv", all_id = pt_all_id, source_table = "emar",
+    drug_name = coalesce(product_description, medication), event_offset_hr
+  )
+
+mimic_steroid_input <- miiv$inputevents %>%
+  as_tibble() %>%
+  semi_join(target_ids_mimic %>% select(stay_id) %>% distinct(),
+            by = "stay_id", copy = TRUE) %>%
+  select(stay_id, starttime, itemid, amount, rate) %>%
+  inner_join(miiv$d_items %>% as_tibble() %>% select(itemid, label), by = "itemid") %>%
+  collect() %>%
+  inner_join(target_ids_mimic %>% select(stay_id, pt_all_id, intime), by = "stay_id") %>%
+  mutate(
+    drug_txt = str_squish(coalesce(label, "")),
+    event_offset_hr = as.numeric(difftime(starttime, intime, units = "hours"))
+  ) %>%
+  filter(
+    str_detect(drug_txt, steroid_pat),
+    keep_systemic(drug_txt),
+    !is.na(event_offset_hr),
+    coalesce(as.numeric(amount), 0) > 0 | coalesce(as.numeric(rate), 0) > 0
+  ) %>%
+  transmute(
+    src_std = "miiv", all_id = pt_all_id, source_table = "inputevents",
+    drug_name = label, event_offset_hr
+  )
+
+# =========================================================
+# 4) eICU steroid events
+# =========================================================
+eicu_steroid_med <- eicu$medication %>%
+  as_tibble() %>%
+  semi_join(
+    target_ids_eicu %>% transmute(patientunitstayid = as.integer(all_id)) %>% distinct(),
+    by = "patientunitstayid", copy = TRUE
+  ) %>%
+  select(patientunitstayid, drugorderoffset, drugstartoffset, drugordercancelled,
+         drugname, routeadmin) %>%
+  collect() %>%
+  mutate(
+    drug_txt = str_squish(coalesce(drugname, "")),
+    route_txt = coalesce(routeadmin, ""),
+    event_offset_hr = as.numeric(coalesce(drugstartoffset, drugorderoffset)) / 60
+  ) %>%
+  filter(
+    str_detect(drug_txt, steroid_pat),
+    keep_systemic(drug_txt, route_txt),
+    str_to_upper(coalesce(drugordercancelled, "NO")) != "YES",
+    !is.na(event_offset_hr)
+  ) %>%
+  transmute(
+    src_std = "eicu", all_id = as.character(patientunitstayid),
+    source_table = "medication", drug_name = drugname, event_offset_hr
+  )
+
+eicu_steroid_inf <- eicu$infusiondrug %>%
+  as_tibble() %>%
+  semi_join(
+    target_ids_eicu %>% transmute(patientunitstayid = as.integer(all_id)) %>% distinct(),
+    by = "patientunitstayid", copy = TRUE
+  ) %>%
+  select(patientunitstayid, infusionoffset, drugname) %>%
+  collect() %>%
+  mutate(
+    drug_txt = str_squish(coalesce(drugname, "")),
+    event_offset_hr = as.numeric(infusionoffset) / 60
+  ) %>%
+  filter(
+    str_detect(drug_txt, steroid_pat),
+    keep_systemic(drug_txt),
+    !is.na(event_offset_hr)
+  ) %>%
+  transmute(
+    src_std = "eicu", all_id = as.character(patientunitstayid),
+    source_table = "infusiondrug", drug_name = drugname, event_offset_hr
+  )
+
+# =========================================================
+# 5) Combine and filter to relevant window
+# =========================================================
+need_window <- pt_ref %>%
+  group_by(src_std, all_id) %>%
+  summarise(
+    need_lo = min(t0_hr, na.rm = TRUE) - 24,
+    need_hi = max(t0_hr, na.rm = TRUE) + 6,
+    .groups = "drop"
+  )
+
+steroid_events <- bind_rows(
+  mimic_steroid_emar, mimic_steroid_input,
+  eicu_steroid_med, eicu_steroid_inf
+) %>%
+  distinct(src_std, all_id, source_table, drug_name, event_offset_hr) %>%
+  inner_join(need_window, by = c("src_std", "all_id")) %>%
+  filter(event_offset_hr >= need_lo, event_offset_hr <= need_hi) %>%
+  select(-need_lo, -need_hi)
+
+# =========================================================
+# 6) Per-row steroid features
+# =========================================================
+steroid_features <- pt_ref %>%
+  select(row_id, src_std, all_id, t0_hr) %>%
+  left_join(steroid_events %>% select(src_std, all_id, event_offset_hr),
+            by = c("src_std", "all_id")) %>%
+  mutate(t_rel = event_offset_hr - t0_hr) %>%
+  group_by(row_id) %>%
+  summarise(
+    steroid_pre24h_any = as.integer(any(!is.na(t_rel) & t_rel >= -24 & t_rel < 0)),
+    steroid_pre24h_closest_hr = {
+      x <- -t_rel[!is.na(t_rel) & t_rel >= -24 & t_rel < 0]
+      if (length(x) == 0L) NA_real_ else min(x, na.rm = TRUE)
+    },
+    steroid_post_0_1h = as.integer(any(!is.na(t_rel) & t_rel >= 0 & t_rel < 1)),
+    steroid_post_1_2h = as.integer(any(!is.na(t_rel) & t_rel >= 1 & t_rel < 2)),
+    steroid_post_2_3h = as.integer(any(!is.na(t_rel) & t_rel >= 2 & t_rel < 3)),
+    steroid_post_3_4h = as.integer(any(!is.na(t_rel) & t_rel >= 3 & t_rel < 4)),
+    steroid_post_4_5h = as.integer(any(!is.na(t_rel) & t_rel >= 4 & t_rel < 5)),
+    steroid_post_5_6h = as.integer(any(!is.na(t_rel) & t_rel >= 5 & t_rel <= 6)),
+    steroid_post_0_6h_any = as.integer(any(!is.na(t_rel) & t_rel >= 0 & t_rel <= 6)),
+    .groups = "drop"
+  )
+
+# =========================================================
+# 7) Attach to pt_vp6
+# =========================================================
+flag_cols <- c(
+  "steroid_pre24h_any", "steroid_post_0_1h", "steroid_post_1_2h",
+  "steroid_post_2_3h", "steroid_post_3_4h", "steroid_post_4_5h",
+  "steroid_post_5_6h", "steroid_post_0_6h_any"
+)
+
+pt_vp6_steroid <- pt_base %>%
+  left_join(steroid_features, by = "row_id") %>%
+  mutate(
+    across(all_of(flag_cols),
+           ~ if_else(can_eval, coalesce(.x, 0L), NA_integer_))
+  ) %>%
+  select(-row_id, -src_std, -all_id_chr, -can_eval)
+
+pt_vp6 <- pt_vp6_steroid
+
+# Create baseline steroid variable
+pt_vp6 <- pt_vp6 %>%
+  mutate(
+    steroid_at_t0 = as.integer(coalesce(steroid_pre24h_any, 0L)),
+    steroid_0_6h  = as.integer(coalesce(steroid_post_0_6h_any, 0L)),
+    steroid_pre   = as.integer(coalesce(as.logical(steroid_at_t0), FALSE))
+  )
+
+cat("steroid_pre distribution:\n")
+print(table(pt_vp6$steroid_pre, useNA = "always"))
+```
+
+## Steroid use by timing group
+
+```{r steroid-by-group}
+# Steroid use in the 0-6h window by group
+pt_vp6 %>%
+  filter(!is.na(obs_group)) %>%
+  group_by(obs_group) %>%
+  summarise(
+    n = n(),
+    steroid_pre24h = sprintf("%d (%.1f%%)",
+      sum(steroid_pre24h_any, na.rm = TRUE),
+      mean(steroid_pre24h_any, na.rm = TRUE) * 100),
+    steroid_0_6h = sprintf("%d (%.1f%%)",
+      sum(steroid_post_0_6h_any, na.rm = TRUE),
+      mean(steroid_post_0_6h_any, na.rm = TRUE) * 100),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(caption = "Steroid use by observed timing group")
+```
+
+# Clone-Censor-Weight with steroid adjustment
+
+## Clone and censor
+
+```{r clone-censor}
+pt_base_ccw <- pt_vp6 %>%
+  filter(!is.na(uid)) %>%
+  select(uid, src, any_of(c(
+    "age", "sex", "bmi", "wt0",
+    "map0", "lact0", "sofa0", "crea0",
+    "norepi_equiv0", "mech_vent0",
+    "tvp_rel", "death_rel", "death_time", "t0_hr",
+    "steroid_pre"
+  )))
+
+pt_clone <- bind_rows(
+  pt_base_ccw %>% mutate(arm = "ultra"),
+  pt_base_ccw %>% mutate(arm = "early")
+) %>%
+  mutate(
+    arm = factor(arm, levels = c("early", "ultra")),
+    censor_time = case_when(
+      arm == "ultra" & (is.na(tvp_rel) | tvp_rel > 3) ~ 3,
+      arm == "early" & !is.na(tvp_rel) & tvp_rel <= 3 ~ tvp_rel,
+      arm == "early" & (is.na(tvp_rel) | tvp_rel > 6) ~ 6,
+      TRUE ~ Inf
+    ),
+    end_time = pmin(
+      coalesce(censor_time, Inf),
+      coalesce(death_rel, Inf),
+      EARLY_END,
+      na.rm = TRUE
+    )
+  )
+```
+
+## Time-varying covariates
+
+```{r tv-covariates}
+ts_tbl_data <- readr::read_rds(
+  "/Users/nakashimatakaya/Desktop/SID/Data/Analysis_Data/septic_shock_imputed_df_new"
+)
+
+ts_tbl_data <- ts_tbl_data %>%
+  mutate(uid = str_c(src, all_id, sep = "::"))
+
+ts_grace_cov <- ts_tbl_data %>%
+  inner_join(pt_vp6 %>% select(uid, t0_hr) %>% distinct(), by = "uid") %>%
+  mutate(t_rel = time_hr - t0_hr, t = as.integer(round(t_rel))) %>%
+  filter(t >= 0, t <= (EARLY_END - 1)) %>%
+  group_by(uid, t) %>%
+  summarise(
+    map = first(map), lact = first(lact),
+    norepi_equiv = first(norepi_equiv), sofa = first(sofa),
+    mech_vent = first(mech_vent), crea = first(crea),
+    epi_rate = first(epi_rate), dopa_rate = first(dopa_rate),
+    dobu_rate = first(dobu_rate), phn_rate = first(phn_rate),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    mech_vent = if_else(mech_vent == "invasive", "invasive", "noninvasive"),
+    mech_vent = replace_na(mech_vent, "noninvasive"),
+    mech_vent_inv = as.integer(mech_vent == "invasive")
+  ) %>%
+  group_by(uid) %>%
+  arrange(t) %>%
+  mutate(
+    ne0 = first(norepi_equiv),
+    ne_from0 = norepi_equiv - ne0,
+    ne_delta1 = norepi_equiv - lag(norepi_equiv)
+  ) %>%
+  ungroup()
+```
+
+## Grace window data construction
+
+```{r grace-window}
+ccw_grace <- pt_clone %>%
+  tidyr::crossing(t = 0:(EARLY_END - 1)) %>%
+  filter(t < end_time) %>%
+  left_join(ts_grace_cov, by = c("uid", "t")) %>%
+  mutate(
+    censor_next = is.finite(censor_time) & ((t + 1) == ceiling(censor_time)),
+    death_next  = is.finite(death_time)  & ((t + 1) == ceiling(death_time / 1)),
+    # Missing data handling (zero + indicator)
+    age_miss  = as.integer(is.na(age)),   age_imp  = replace_na(as.numeric(age), 0),
+    bmi_miss  = as.integer(is.na(bmi)),   bmi_imp  = replace_na(as.numeric(bmi), 0),
+    wt0_miss  = as.integer(is.na(wt0)),   wt0_imp  = replace_na(as.numeric(wt0), 0),
+    map_miss  = as.integer(is.na(map)),   map_imp  = replace_na(as.numeric(map), 0),
+    lact_miss = as.integer(is.na(lact)),  lact_imp = replace_na(as.numeric(lact), 0),
+    crea_miss = as.integer(is.na(crea)),  crea_imp = replace_na(as.numeric(crea), 0),
+    ne_miss   = as.integer(is.na(norepi_equiv)), ne_imp = replace_na(as.numeric(norepi_equiv), 0),
+    sofa_miss = as.integer(is.na(sofa)),  sofa_imp = replace_na(as.numeric(sofa), 0),
+    ne_from0_miss  = as.integer(is.na(ne_from0)),  ne_from0_imp  = replace_na(as.numeric(ne_from0), 0),
+    ne_delta1_miss = as.integer(is.na(ne_delta1)), ne_delta1_imp = replace_na(as.numeric(ne_delta1), 0),
+    epi_miss  = as.integer(is.na(epi_rate)),  epi_imp  = replace_na(as.numeric(epi_rate), 0),
+    dopa_miss = as.integer(is.na(dopa_rate)), dopa_imp = replace_na(as.numeric(dopa_rate), 0),
+    dobu_miss = as.integer(is.na(dobu_rate)), dobu_imp = replace_na(as.numeric(dobu_rate), 0),
+    phn_miss  = as.integer(is.na(phn_rate)),  phn_imp  = replace_na(as.numeric(phn_rate), 0),
+    steroid_pre = replace_na(as.integer(steroid_pre), 0L)
+  )
+```
+
+## IPCW estimation (steroid-adjusted)
+
+```{r ipcw-steroid, cache=TRUE}
+fit_ipcw_one_arm <- function(dat) {
+  if (sum(dat$censor_next, na.rm = TRUE) < 2) {
+    dat$w_ipcw <- 1
+    dat$w_final <- 1
+    return(dat)
+  }
+
+  sex_term <- if (n_distinct(dat$sex, na.rm = TRUE) >= 2) " + sex" else ""
+  src_term <- if (n_distinct(dat$src, na.rm = TRUE) >= 2) " + src" else ""
+
+  # Numerator (stabilized)
+  f_num <- as.formula(paste0(
+    "censor_next ~ ns(t, 3)", sex_term, src_term,
+    " + age_imp + age_miss + bmi_imp + bmi_miss + wt0_imp + wt0_miss"
+  ))
+
+  # Denominator: all covariates + steroid_pre
+  f_den <- as.formula(paste0(
+    "censor_next ~ ns(t, 3)", sex_term, src_term,
+    " + age_imp + age_miss + bmi_imp + bmi_miss + wt0_imp + wt0_miss",
+    " + map_imp + map_miss + lact_imp + lact_miss + crea_imp + crea_miss",
+    " + ne_imp + ne_miss + ne_from0_imp + ne_from0_miss + ne_delta1_imp + ne_delta1_miss",
+    " + epi_imp + epi_miss + dopa_imp + dopa_miss + dobu_imp + dobu_miss + phn_imp + phn_miss",
+    " + sofa_imp + sofa_miss + mech_vent_inv",
+    " + steroid_pre"
+  ))
+
+  fit_num <- glm(f_num, data = dat, family = binomial(), control = glm.control(maxit = 50))
+  fit_den <- glm(f_den, data = dat, family = binomial(), control = glm.control(maxit = 50))
+
+  p_num <- pmin(pmax(predict(fit_num, type = "response"), P_CLIP), 1 - P_CLIP)
+  p_den <- pmin(pmax(predict(fit_den, type = "response"), P_CLIP), 1 - P_CLIP)
+
+  dat %>%
+    mutate(w_ratio = (1 - p_num) / (1 - p_den)) %>%
+    group_by(uid, arm) %>%
+    arrange(t) %>%
+    mutate(
+      w_cum   = cumprod(w_ratio),
+      w_ipcw  = lag(w_cum, default = 1),
+      w_final = last(w_cum)
+    ) %>%
+    ungroup()
+}
+
+cat("Fitting steroid-adjusted IPCW...\n")
+w_u <- fit_ipcw_one_arm(ccw_grace %>% filter(arm == "ultra", death_next == FALSE))
+w_e <- fit_ipcw_one_arm(ccw_grace %>% filter(arm == "early", death_next == FALSE))
+w_grace <- bind_rows(w_u, w_e)
+
+cat("Weight distribution:\n")
+print(summary(w_grace$w_final))
+```
+
+## CCW table construction
+
+```{r ccw-table}
+ccw_tbl_steroid <- w_grace %>%
+  group_by(uid, arm) %>%
+  arrange(desc(t)) %>%
+  slice(1) %>%
+  ungroup() %>%
+  mutate(
+    weight = w_final,
+    event  = is.finite(death_time) & (death_time <= DAY28_HR),
+    tstart = 0,
+    tstop  = pmin(coalesce(death_time, Inf), DAY28_HR, na.rm = TRUE)
+  )
+
+cap99_s <- as.numeric(quantile(ccw_tbl_steroid$weight, 0.99, na.rm = TRUE))
+cap95_s <- as.numeric(quantile(ccw_tbl_steroid$weight, 0.95, na.rm = TRUE))
+```
+
+# Outcome variables
+
+```{r outcomes}
+outcome_data <- ts_out %>%
+  select(uid, death_time, aki2_time, aki3_time, aki2_at0, aki3_at0,
+         rrt_time, crrt_time, rrt_pre, crrt_pre,
+         shock_resolve_time, net_negative_time) %>%
+  distinct() %>%
+  mutate(across(everything(), ~ replace(.x, is.infinite(.x), NA)))
+
+if (all(c("amio_time", "lido_time", "proc_time") %in% names(ts_out))) {
+  antiarr_data <- ts_out %>%
+    select(uid, amio_time, lido_time, proc_time,
+           any_of(c("amio_pre", "lido_pre", "proc_pre"))) %>%
+    distinct() %>%
+    mutate(
+      antiarr_time = pmin(amio_time, lido_time, proc_time, na.rm = TRUE),
+      antiarr_pre = coalesce(amio_pre, FALSE) | coalesce(lido_pre, FALSE) | coalesce(proc_pre, FALSE)
+    ) %>%
+    select(uid, antiarr_time, antiarr_pre)
+  outcome_data <- outcome_data %>% left_join(antiarr_data, by = "uid")
+} else {
+  outcome_data <- outcome_data %>%
+    mutate(antiarr_time = NA_real_, antiarr_pre = FALSE)
+}
+
+outcome_flags <- outcome_data %>%
+  mutate(
+    death28     = is.finite(death_time) & death_time <= DAY28_HR,
+    aki2_28     = !coalesce(aki2_at0, FALSE) & is.finite(aki2_time) & aki2_time <= DAY28_HR,
+    aki3_28     = !coalesce(aki3_at0, FALSE) & is.finite(aki3_time) & aki3_time <= DAY28_HR,
+    rrt_28      = !coalesce(rrt_pre, FALSE) & is.finite(rrt_time) & rrt_time <= DAY28_HR,
+    crrt_28     = !coalesce(crrt_pre, FALSE) & is.finite(crrt_time) & crrt_time <= DAY28_HR,
+    antiarr_28  = !coalesce(antiarr_pre, FALSE) & is.finite(antiarr_time) & antiarr_time <= DAY28_HR,
+    shockres_28 = is.finite(shock_resolve_time) & shock_resolve_time <= DAY28_HR,
+    netneg_28   = is.finite(net_negative_time) & net_negative_time <= DAY28_HR
+  ) %>%
+  select(uid, death28, aki2_28, aki3_28, rrt_28, crrt_28, antiarr_28, shockres_28, netneg_28)
+
+ccw_with_outcomes <- ccw_tbl_steroid %>%
+  left_join(outcome_flags, by = "uid")
+
+# Attach outcomes to pt_vp6
+if (!"death28" %in% names(pt_vp6)) {
+  pt_vp6 <- pt_vp6 %>%
+    select(-any_of(names(outcome_flags)[names(outcome_flags) != "uid"])) %>%
+    left_join(outcome_flags, by = "uid")
+}
+```
+
+# Helper functions
+
+```{r helpers}
+extract_hr <- function(fit, term = "armultra") {
+  ci <- summary(fit)$conf.int[term, , drop = FALSE]
+  tibble(HR = ci[1, "exp(coef)"], lower = ci[1, "lower .95"], upper = ci[1, "upper .95"])
+}
+
+fmt_n <- function(x) format(as.integer(x), big.mark = ",")
+```
+
+# Figure 1: Study flow diagram
+
+```{r fig1-flow, fig.width=11, fig.height=9}
+grid.newpage()
+
+txt_gp  <- gpar(fontsize = 14)
+txt_gpS <- gpar(fontsize = 14)
+box_gp  <- gpar(fill = "white")
+
+box1 <- boxGrob(
+  paste0("Adults with septic shock in MIMIC-IV and eICU-CRD\n",
+         "(N = 21,587; MIMIC-IV 14,531, eICU-CRD 7,056)"),
+  x = 0.42, y = 0.85, txt_gp = txt_gp, box_gp = box_gp
+)
+
+box_excl <- boxGrob(
+  paste0("Excluded (n = 16,430)\n",
+         "NE-equivalent dose <0.25 \u00b5g/kg/min\n",
+         "Vasopressin before time zero\n",
+         "No post-escalation follow-up"),
+  x = 0.82, y = 0.735, txt_gp = txt_gpS, box_gp = box_gp
+)
+
+box2 <- boxGrob(
+  paste0("Eligible at time zero\n",
+         "NE-equivalent dose \u22650.25 \u00b5g/kg/min, no prior vasopressin\n",
+         "(n = 5,157; MIMIC-IV 2,721, eICU-CRD 2,436)"),
+  x = 0.42, y = 0.61, txt_gp = txt_gp, box_gp = box_gp
+)
+
+box3 <- boxGrob(
+  paste0("Initiated vasopressin within 6 h after time zero\n",
+         "(n = 1,266; MIMIC-IV 624, eICU-CRD 642)"),
+  x = 0.42, y = 0.45, txt_gp = txt_gp, box_gp = box_gp
+)
+
+box_u <- boxGrob(
+  paste0("Ultra-early (0\u20133 h)\n",
+         "(n = 943; MIMIC-IV 422, eICU-CRD 521)"),
+  x = 0.22, y = 0.25, txt_gp = txt_gp, box_gp = box_gp
+)
+
+box_e <- boxGrob(
+  paste0("Early (>3\u20136 h)\n",
+         "(n = 323; MIMIC-IV 202, eICU-CRD 121)"),
+  x = 0.62, y = 0.25, txt_gp = txt_gp, box_gp = box_gp
+)
+
+connectGrob(box1, box2, type = "vertical")
+connectGrob(box1, box_excl, type = "L")
+connectGrob(box2, box3, type = "vertical")
+connectGrob(box3, box_u, type = "N")
+connectGrob(box3, box_e, type = "N")
+
+box1; box_excl; box2; box3; box_u; box_e
+```
+
+# Primary analysis
+
+## Cox models (steroid-adjusted)
+
+```{r primary-cox}
+run_cox_s <- function(cap_val, label) {
+  dat <- ccw_tbl_steroid %>%
+    mutate(w = pmax(1e-6, pmin(weight, cap_val)),
+           src = factor(src),
+           arm = factor(arm, levels = c("early", "ultra")))
+  fit <- coxph(Surv(tstart, tstop, event) ~ arm + strata(src),
+               data = dat, weights = w, robust = TRUE, cluster = uid)
+  extract_hr(fit) %>% mutate(model = label)
+}
+
+res_99 <- run_cox_s(cap99_s, "IPCW Cox (99th percentile truncation)")
+res_95 <- run_cox_s(cap95_s, "IPCW Cox (95th percentile truncation)")
+
+# Doubly robust
+dat_dr <- ccw_with_outcomes %>%
+  mutate(w = pmax(1e-6, pmin(weight, cap99_s)),
+         arm = factor(arm, levels = c("early", "ultra")),
+         src = factor(src))
+
+if (!"mech_vent_inv" %in% names(dat_dr) && "mech_vent0" %in% names(dat_dr)) {
+  dat_dr <- dat_dr %>%
+    mutate(mech_vent_inv = as.integer(as.character(mech_vent0) == "invasive"))
+}
+
+dr_covs <- intersect(
+  c("age", "bmi", "wt0", "map0", "lact0", "crea0", "norepi_equiv0",
+    "sofa0", "mech_vent_inv", "steroid_pre"),
+  names(dat_dr)
+)
+
+for (v in dr_covs) dat_dr[[v]] <- replace_na(as.numeric(dat_dr[[v]]), 0)
+
+dr_formula <- as.formula(paste0(
+  "Surv(tstart, tstop, event) ~ arm + strata(src) + ",
+  paste(dr_covs, collapse = " + ")
+))
+
+fit_dr <- tryCatch(
+  coxph(dr_formula, data = dat_dr, weights = w, robust = TRUE, cluster = uid),
+  error = function(e) {
+    coxph(Surv(tstart, tstop, event) ~ arm + strata(src),
+          data = dat_dr, weights = w, robust = TRUE, cluster = uid)
+  }
+)
+
+res_dr <- extract_hr(fit_dr) %>% mutate(model = "IPCW Cox + outcome regression")
+res_primary <- bind_rows(res_99, res_95, res_dr)
+
+knitr::kable(res_primary, digits = 3, caption = "Primary results (steroid-adjusted)")
+```
+
+# Figure 2: Weighted survival curves
+
+```{r fig2-survival, fig.width=10, fig.height=7, cache=TRUE}
+tmp_surv <- ccw_with_outcomes %>%
+  mutate(w = pmax(1e-6, pmin(weight, cap99_s)),
+         arm = factor(arm, levels = c("early", "ultra")))
+
+sf <- survfit(Surv(tstart, tstop, event) ~ arm, data = tmp_surv, weights = w, id = uid)
+
+sf_df <- tibble(
+  time = sf$time, surv = sf$surv,
+  upper = sf$upper, lower = sf$lower,
+  arm = rep(names(sf$strata), sf$strata)
+) %>%
+  mutate(
+    arm = str_replace(arm, "arm=", ""),
+    arm = case_when(
+      arm == "ultra" ~ "0\u20133 h (ultra-early)",
+      arm == "early" ~ ">3\u20136 h (early)", TRUE ~ arm
+    ),
+    arm = factor(arm, levels = c("0\u20133 h (ultra-early)", ">3\u20136 h (early)"))
+  )
+
+# 28-day risks
+risk_ultra <- 1 - min(sf_df$surv[sf_df$arm == "0\u20133 h (ultra-early)" & sf_df$time <= DAY28_HR])
+risk_early <- 1 - min(sf_df$surv[sf_df$arm == ">3\u20136 h (early)" & sf_df$time <= DAY28_HR])
+rd_point <- (risk_ultra - risk_early) * 100
+
+# RMST bootstrap
+set.seed(SEED)
+
+calc_rmst_from_sf <- function(sf_obj, strata_name, tau) {
+  idx <- which(names(sf_obj$strata) == strata_name)
+  if (length(idx) == 0) return(NA_real_)
+  s_idx <- if (idx == 1) 1 else (cumsum(sf_obj$strata)[idx - 1] + 1)
+  e_idx <- cumsum(sf_obj$strata)[idx]
+  t_vec <- sf_obj$time[s_idx:e_idx]
+  s_vec <- sf_obj$surv[s_idx:e_idx]
+  t_use <- c(0, t_vec[t_vec <= tau], tau)
+  s_use <- c(1, s_vec[t_vec <= tau])
+  if (length(s_use) < length(t_use)) s_use <- c(s_use, tail(s_use, 1))
+  sum(diff(t_use) * head(s_use, -1))
+}
+
+rmst_u_pt <- calc_rmst_from_sf(sf, "arm=ultra", DAY28_HR)
+rmst_e_pt <- calc_rmst_from_sf(sf, "arm=early", DAY28_HR)
+rmst_diff_pt <- (rmst_u_pt - rmst_e_pt) / 24
+
+boot_fn <- function(data, tau) {
+  uids <- unique(data$uid)
+  boot_ids <- sample(uids, length(uids), replace = TRUE)
+  bd <- map_dfr(seq_along(boot_ids), ~ data %>% filter(uid == boot_ids[.x]) %>% mutate(uid_b = .x))
+  sf_b <- tryCatch(
+    survfit(Surv(tstart, tstop, event) ~ arm, data = bd, weights = w, id = uid_b),
+    error = function(e) NULL
+  )
+  if (is.null(sf_b)) return(c(rmst_diff = NA, rd = NA))
+  rmst_u <- calc_rmst_from_sf(sf_b, "arm=ultra", tau)
+  rmst_e <- calc_rmst_from_sf(sf_b, "arm=early", tau)
+  sf_b_df <- tibble(time = sf_b$time, surv = sf_b$surv,
+                    arm = rep(names(sf_b$strata), sf_b$strata)) %>%
+    mutate(arm = str_replace(arm, "arm=", ""))
+  r_u <- 1 - min(sf_b_df$surv[sf_b_df$arm == "ultra" & sf_b_df$time <= tau], na.rm = TRUE)
+  r_e <- 1 - min(sf_b_df$surv[sf_b_df$arm == "early" & sf_b_df$time <= tau], na.rm = TRUE)
+  c(rmst_diff = (rmst_u - rmst_e) / 24, rd = (r_u - r_e) * 100)
+}
+
+cat("Running bootstrap (", B_BOOT, "iterations)...\n")
+
+write_rds(boot_res, "/Users/nakashimatakaya/Desktop/SID/Data/Analysis_Data_20260320/boot_res")
+boot_res <- read_rds("/Users/nakashimatakaya/Desktop/SID/Data/Analysis_Data_20260320/boot_res")
+#boot_res <- replicate(B_BOOT, boot_fn(tmp_surv, DAY28_HR))
+boot_mat <- t(boot_res)
+boot_mat <- boot_mat[complete.cases(boot_mat), ]
+rmst_ci <- quantile(boot_mat[, "rmst_diff"], c(0.025, 0.975))
+rd_ci <- quantile(boot_mat[, "rd"], c(0.025, 0.975))
+
+# Number at risk
+nar_times <- seq(0, DAY28_HR, by = 168)
+nar_df <- map_dfr(c("ultra", "early"), function(a) {
+  d <- tmp_surv %>% filter(arm == a)
+  label <- if_else(a == "ultra", "0\u20133 h", ">3\u20136 h")
+  map_dfr(nar_times, function(t_hr) {
+    n <- sum(d$tstart <= t_hr & d$tstop > t_hr, na.rm = TRUE)
+    tibble(arm_label = label, time = t_hr, n_risk = n)
+  })
+})
+
+annot_text <- paste0(
+  "Day-28 mortality risk\n",
+  sprintf("  0\u20133 h: %.1f%%\n", risk_ultra * 100),
+  sprintf("  >3\u20136 h: %.1f%%\n", risk_early * 100),
+  sprintf("Risk difference: %.1f pp (%.1f to %.1f)\n", rd_point, rd_ci[1], rd_ci[2]),
+  sprintf("RMST difference: +%.2f days (%.2f to %.2f)\n", rmst_diff_pt, rmst_ci[1], rmst_ci[2]),
+  sprintf("HR: %.2f (%.2f\u2013%.2f)", res_99$HR, res_99$lower, res_99$upper)
+)
+
+fig2 <- ggplot(sf_df, aes(x = time, y = surv, linetype = arm)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill = arm), alpha = 0.15, colour = NA) +
+  geom_step(linewidth = 0.7, colour = "black") +
+  scale_fill_manual(values = c("0\u20133 h (ultra-early)" = "grey30", ">3\u20136 h (early)" = "grey60"),
+                    guide = "none") +
+  scale_linetype_manual(values = c("0\u20133 h (ultra-early)" = "solid", ">3\u20136 h (early)" = "dashed")) +
+  scale_x_continuous(breaks = nar_times, labels = nar_times / 24,
+                     limits = c(0, DAY28_HR), expand = c(0.01, 0)) +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2),
+                     labels = percent_format(accuracy = 1), expand = c(0.01, 0)) +
+  annotate("text", x = DAY28_HR * 0.42, y = 0.18, label = annot_text,
+           hjust = 0, vjust = 0, size = 3.2, lineheight = 1.2) +
+  labs(x = "Days after time zero", y = "Survival probability", linetype = NULL) +
+  theme_bw(base_size = 11) +
+  theme(legend.position = c(0.78, 0.92), legend.background = element_blank(),
+        legend.key.width = unit(1.5, "cm"), panel.grid.minor = element_blank(),
+        plot.margin = margin(5.5, 10, 40, 10))
+
+nar_plot <- ggplot(nar_df, aes(x = time, y = arm_label, label = n_risk)) +
+  geom_text(size = 3.2) +
+  scale_x_continuous(breaks = nar_times, limits = c(0, DAY28_HR), expand = c(0.01, 0)) +
+  labs(x = NULL, y = NULL) +
+  theme_void(base_size = 11) +
+  theme(axis.text.y = element_text(size = 9, hjust = 1),
+        plot.margin = margin(0, 10, 5.5, 10))
+
+fig2_combined <- fig2 / nar_plot + plot_layout(heights = c(5, 1))
+fig2_combined
+```
+
+# Figure 3: Primary and secondary outcomes
+
+## Figure 3A: Primary robustness
+
+```{r fig3a}
+primary_order <- c(
+  "IPCW Cox (99th percentile truncation)",
+  "IPCW Cox (95th percentile truncation)",
+  "IPCW Cox + outcome regression"
+)
+
+primary_plot_df <- res_primary %>%
+  mutate(hr_label = sprintf("%.2f (%.2f\u2013%.2f)", HR, lower, upper),
+         label = factor(model, levels = rev(primary_order)))
+
+fig3A <- ggplot(primary_plot_df, aes(x = HR, y = label)) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey30") +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.15, linewidth = 0.6) +
+  geom_point(size = 3.5) +
+  geom_text(aes(label = hr_label), vjust = -1.1, size = 3.6, colour = "grey20") +
+  scale_x_log10(breaks = c(0.5, 0.6, 0.7, 0.8, 0.9, 1.0)) +
+  coord_cartesian(xlim = c(0.48, 1.08), clip = "off") +
+  labs(title = "A  Primary outcome", x = "Hazard ratio (ultra-early vs early)", y = NULL) +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.y = element_blank(),
+        plot.title = element_text(face = "bold"), plot.margin = margin(24, 10, 5.5, 5.5))
+```
+
+## Figure 3B: Secondary outcomes
+
+```{r fig3b}
+sec_outcomes <- c("aki2_28", "aki3_28", "rrt_28", "crrt_28",
+                  "antiarr_28", "shockres_28", "netneg_28")
+sec_labels <- c(
+  "Acute kidney injury (KDIGO stage \u22652)",
+  "Acute kidney injury (KDIGO stage \u22653)",
+  "Renal replacement therapy initiation",
+  "Continuous renal replacement therapy initiation",
+  "Medically treated arrhythmia",
+  "Shock resolution",
+  "Net negative fluid balance"
+)
+
+sec_data <- ccw_tbl_steroid %>%
+  left_join(pt_vp6 %>% select(uid, any_of(sec_outcomes)) %>% distinct(), by = "uid")
+
+sec_results <- map2_dfr(sec_outcomes, sec_labels, function(ov, ol) {
+  if (!ov %in% names(sec_data)) return(tibble(outcome = ol, HR = NA_real_, LCL = NA_real_, UCL = NA_real_))
+  dat <- sec_data %>%
+    filter(!is.na(.data[[ov]])) %>%
+    mutate(w = pmax(1e-6, pmin(weight, cap99_s)),
+           arm = factor(arm, levels = c("early", "ultra")),
+           ev = as.integer(as.logical(.data[[ov]])))
+  if (sum(dat$ev, na.rm = TRUE) < 5 || n_distinct(dat$arm) < 2)
+    return(tibble(outcome = ol, HR = NA_real_, LCL = NA_real_, UCL = NA_real_))
+  fit <- tryCatch(
+    coxph(Surv(tstart, tstop, ev) ~ arm, data = dat, weights = w, robust = TRUE, cluster = uid),
+    error = function(e) NULL
+  )
+  if (is.null(fit)) return(tibble(outcome = ol, HR = NA_real_, LCL = NA_real_, UCL = NA_real_))
+  ci <- summary(fit)$conf.int["armultra", , drop = FALSE]
+  tibble(outcome = ol, HR = ci[1, "exp(coef)"], LCL = ci[1, "lower .95"], UCL = ci[1, "upper .95"])
+})
+
+sec_plot_df <- sec_results %>%
+  filter(!is.na(HR)) %>%
+  mutate(hr_label = sprintf("%.2f (%.2f\u2013%.2f)", HR, LCL, UCL),
+         label = factor(outcome, levels = rev(sec_labels)))
+
+x_lo <- min(0.85, min(sec_plot_df$LCL, na.rm = TRUE) * 0.95)
+x_hi <- max(1.10, max(sec_plot_df$UCL, na.rm = TRUE) * 1.05)
+
+fig3B <- ggplot(sec_plot_df, aes(x = HR, y = label)) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey30") +
+  geom_errorbarh(aes(xmin = LCL, xmax = UCL), height = 0.20, linewidth = 0.50) +
+  geom_point(size = 3) +
+  geom_text(aes(label = hr_label), vjust = -1.1, size = 3.0, colour = "grey20") +
+  scale_x_log10() +
+  coord_cartesian(xlim = c(x_lo, x_hi), clip = "off") +
+  labs(title = "B  Secondary outcomes",
+       x = "Subdistribution hazard ratio (ultra-early vs early)", y = NULL) +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.y = element_blank(),
+        plot.title = element_text(face = "bold"), plot.margin = margin(24, 12, 5.5, 5.5))
+```
+
+```{r fig3-combined, fig.width=10, fig.height=10}
+fig3 <- fig3A / fig3B + plot_layout(heights = c(1, 1.15))
+fig3
+```
+
+# Table 1: Baseline characteristics
+
+```{r table1}
+# Prepare variables
+pt_vp6 <- pt_vp6 %>%
+  mutate(
+    steroid_pre_f = factor(
+      as.integer(coalesce(as.logical(steroid_pre), FALSE)),
+      levels = c(0L, 1L), labels = c("No", "Yes")
+    ),
+    obs_group = case_when(
+      tvp_rel <= 3 ~ "Ultra-early (0\u20133 h)",
+      tvp_rel <= 6 ~ "Early (>3\u20136 h)",
+      TRUE ~ NA_character_
+    ),
+    mech_vent0_bin = factor(
+      as.integer(as.character(mech_vent0) == "invasive"),
+      levels = c(0L, 1L), labels = c("No", "Yes")
+    )
+  )
+
+tbl1_data <- pt_vp6 %>%
+  filter(!is.na(obs_group)) %>%
+  select(obs_group, age, sex, bmi, wt0, map0, lact0, sofa0, crea0,
+         norepi_equiv0, mech_vent0_bin, steroid_pre_f,
+         any_of(c("death28", "aki2_28", "aki3_28", "rrt_28", "crrt_28",
+                  "antiarr_28", "shockres_28", "netneg_28")))
+
+label_list <- list(
+  age = "Age, years", sex = "Sex",
+  bmi = "Body mass index, kg/m\u00b2", wt0 = "Body weight, kg",
+  map0 = "Mean arterial pressure, mmHg", lact0 = "Lactate, mmol/L",
+  sofa0 = "SOFA score", crea0 = "Creatinine, mg/dL",
+  norepi_equiv0 = "Norepinephrine-equivalent dose, \u00b5g/kg/min",
+  mech_vent0_bin = "Invasive mechanical ventilation",
+  steroid_pre_f = "Systemic corticosteroid use before time zero",
+  death28 = "Death by day 28",
+  aki2_28 = "AKI (KDIGO stage \u22652) by day 28",
+  aki3_28 = "AKI (KDIGO stage \u22653) by day 28",
+  rrt_28 = "RRT initiation by day 28",
+  crrt_28 = "CRRT initiation by day 28",
+  antiarr_28 = "Medically treated arrhythmia by day 28",
+  shockres_28 = "Shock resolution by day 28",
+  netneg_28 = "Net negative fluid balance by day 28"
+)
+
+tbl1 <- tbl1_data %>%
+  tbl_summary(
+    by = obs_group,
+    label = label_list[intersect(names(label_list), names(tbl1_data))],
+    statistic = list(all_continuous() ~ "{median} ({p25}, {p75})",
+                     all_categorical() ~ "{n} ({p}%)"),
+    digits = list(all_continuous() ~ 1, all_categorical() ~ c(0, 1)),
+    missing = "no"
+  ) %>%
+  add_overall() %>%
+  modify_header(label = "**Variable**") %>%
+  bold_labels()
+
+tbl1
+```
+
+# Supplementary figures
+
+## S-Figure 3: Weight distribution
+
+```{r sfig3, fig.width=8, fig.height=5}
+sfig3_df <- ccw_with_outcomes %>%
+  mutate(w_trunc = pmin(weight, cap99_s),
+         arm_label = if_else(arm == "ultra", "0\u20133 h (ultra-early)", ">3\u20136 h (early)"))
+
+sfig3 <- ggplot(sfig3_df, aes(x = w_trunc, fill = arm_label)) +
+  geom_histogram(bins = 50, alpha = 0.7, position = "identity") +
+  scale_fill_manual(values = c("0\u20133 h (ultra-early)" = "grey30", ">3\u20136 h (early)" = "grey70")) +
+  labs(x = "Stabilized IPCW (truncated at 99th percentile)", y = "Count", fill = NULL) +
+  theme_bw(base_size = 11) + theme(legend.position = "top")
+sfig3
+```
+
+## S-Figure 4: Love plot (SMD)
+
+```{r sfig4, fig.width=8, fig.height=6}
+var_name_map <- c(
+  age = "Age, years", sex = "Male sex",
+  bmi = "Body mass index, kg/m\u00b2", wt0 = "Body weight, kg",
+  map0 = "Mean arterial pressure, mmHg", lact0 = "Lactate, mmol/L",
+  sofa0 = "SOFA score", crea0 = "Creatinine, mg/dL",
+  norepi_equiv0 = "Norepinephrine-equivalent dose, \u00b5g/kg/min",
+  mech_vent0 = "Invasive mechanical ventilation",
+  steroid_pre = "Systemic corticosteroid use"
+)
+
+cov_vars <- intersect(names(var_name_map), names(ccw_with_outcomes))
+
+ccw_num <- ccw_with_outcomes %>%
+  mutate(across(any_of(c("sex", "mech_vent0")), ~ as.numeric(as.factor(.x))),
+         w_trunc = pmax(1e-6, pmin(weight, cap99_s)))
+
+calc_smd <- function(dat, var, wt = NULL) {
+  d <- dat %>% filter(!is.na(.data[[var]]))
+  if (nrow(d) == 0) return(NA_real_)
+  x <- as.numeric(d[[var]]); a <- d$arm == "ultra"
+  w <- if (!is.null(wt) && wt %in% names(d)) d[[wt]] else rep(1, nrow(d))
+  m1 <- weighted.mean(x[a], w[a], na.rm = TRUE)
+  m0 <- weighted.mean(x[!a], w[!a], na.rm = TRUE)
+  v1 <- sum(w[a] * (x[a] - m1)^2, na.rm = TRUE) / sum(w[a], na.rm = TRUE)
+  v0 <- sum(w[!a] * (x[!a] - m0)^2, na.rm = TRUE) / sum(w[!a], na.rm = TRUE)
+  denom <- sqrt((v1 + v0) / 2)
+  if (denom < 1e-10) return(0)
+  (m1 - m0) / denom
+}
+
+smd_df <- tibble(variable = cov_vars) %>%
+  rowwise() %>%
+  mutate(smd_raw = calc_smd(ccw_num, variable),
+         smd_wt = calc_smd(ccw_num, variable, "w_trunc"),
+         var_label = unname(var_name_map[variable])) %>%
+  ungroup() %>%
+  pivot_longer(c(smd_raw, smd_wt), names_to = "type", values_to = "smd") %>%
+  mutate(type = if_else(type == "smd_raw", "Before weighting", "After weighting"),
+         var_label = factor(var_label, levels = rev(unname(var_name_map[cov_vars]))))
+
+sfig4 <- ggplot(smd_df, aes(x = abs(smd), y = var_label, colour = type, shape = type)) +
+  geom_vline(xintercept = 0.1, linetype = "dashed", colour = "grey50") +
+  geom_point(size = 3) +
+  scale_colour_manual(values = c("Before weighting" = "grey50", "After weighting" = "black")) +
+  labs(x = "Absolute standardized mean difference", y = NULL, colour = NULL, shape = NULL) +
+  theme_bw(base_size = 11) + theme(legend.position = "top")
+sfig4
+```
+
+## S-Figure 5: Subgroup analyses
+
+```{r sfig5, fig.width=10, fig.height=6}
+ccw_sub <- ccw_with_outcomes %>%
+  mutate(w = pmax(1e-6, pmin(weight, cap99_s)))
+
+sub_needed <- intersect(c("lact0", "norepi_equiv0", "mech_vent0"), names(pt_vp6))
+ccw_sub <- ccw_sub %>%
+  select(-any_of(sub_needed)) %>%
+  left_join(pt_vp6 %>% select(uid, all_of(sub_needed)) %>% distinct(), by = "uid") %>%
+  mutate(
+    lact_grp = case_when(lact0 < 2 ~ "<2 mmol/L", lact0 < 4 ~ "2\u2013<4 mmol/L", TRUE ~ "\u22654 mmol/L"),
+    ne_grp = if_else(norepi_equiv0 < 0.30, "<0.30 \u00b5g/kg/min", "\u22650.30 \u00b5g/kg/min"),
+    mv_grp = if_else(as.character(mech_vent0) == "invasive", "Invasive", "Non-invasive")
+  )
+
+fit_sub <- function(dat, grp_var, grp_label) {
+  dat %>%
+    filter(!is.na(.data[[grp_var]])) %>%
+    group_by(level = .data[[grp_var]]) %>%
+    group_modify(~ {
+      d <- .x %>% mutate(arm = factor(arm, levels = c("early", "ultra")))
+      if (n_distinct(d$arm) < 2 || sum(d$event) < 3) return(tibble())
+      fit <- tryCatch(
+        coxph(Surv(tstart, tstop, event) ~ arm, data = d, weights = w, robust = TRUE, cluster = uid),
+        error = function(e) NULL
+      )
+      if (is.null(fit)) return(tibble())
+      ci <- summary(fit)$conf.int["armultra", , drop = FALSE]
+      tibble(HR = ci[1, "exp(coef)"], lower = ci[1, "lower .95"], upper = ci[1, "upper .95"])
+    }) %>%
+    ungroup() %>%
+    mutate(subgroup = grp_label)
+}
+
+sub_results <- bind_rows(
+  fit_sub(ccw_sub, "lact_grp", "Lactate"),
+  fit_sub(ccw_sub, "ne_grp", "NE-equivalent dose"),
+  fit_sub(ccw_sub, "mv_grp", "Mechanical ventilation")
+)
+
+sub_plot_df <- sub_results %>%
+  filter(!is.na(HR)) %>%
+  mutate(display = paste0(subgroup, ": ", level),
+         hr_label = sprintf("%.2f (%.2f\u2013%.2f)", HR, lower, upper),
+         display = fct_rev(fct_inorder(display)))
+
+sfig5 <- ggplot(sub_plot_df, aes(x = HR, y = display)) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey30") +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.15, linewidth = 0.5) +
+  geom_text(aes(label = hr_label), vjust = -1.2, size = 3.2, colour = "grey20") +
+  scale_x_log10(breaks = c(0.3, 0.5, 1.0, 2.0, 3.0, 5.0)) +
+  coord_cartesian(xlim = c(0.3, 5.5)) +
+  labs(x = "Hazard ratio (ultra-early vs early)", y = NULL) +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.y = element_blank())
+sfig5
+```
+
+## S-Figure 6: Database-specific estimates
+
+```{r sfig6, fig.width=8, fig.height=4}
+db_results <- map_dfr(unique(ccw_with_outcomes$src), function(db) {
+  dat_db <- ccw_with_outcomes %>%
+    filter(src == db) %>%
+    mutate(w = pmax(1e-6, pmin(weight, cap99_s)),
+           arm = factor(arm, levels = c("early", "ultra")))
+  if (n_distinct(dat_db$arm) < 2 || sum(dat_db$event) < 5)
+    return(tibble(database = db, HR = NA_real_, lower = NA_real_, upper = NA_real_))
+  fit <- tryCatch(
+    coxph(Surv(tstart, tstop, event) ~ arm, data = dat_db, weights = w, robust = TRUE, cluster = uid),
+    error = function(e) NULL
+  )
+  if (is.null(fit)) return(tibble(database = db, HR = NA_real_, lower = NA_real_, upper = NA_real_))
+  ci <- summary(fit)$conf.int["armultra", , drop = FALSE]
+  tibble(database = db, HR = ci[1, "exp(coef)"], lower = ci[1, "lower .95"], upper = ci[1, "upper .95"])
+})
+
+db_plot_df <- db_results %>%
+  filter(!is.na(HR)) %>%
+  mutate(hr_label = sprintf("%.2f (%.2f\u2013%.2f)", HR, lower, upper),
+         database = fct_rev(fct_inorder(database)))
+
+sfig6 <- ggplot(db_plot_df, aes(x = HR, y = database)) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey30") +
+  geom_point(size = 3.5) +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.15, linewidth = 0.6) +
+  geom_text(aes(label = hr_label), vjust = -1.2, size = 3.4, colour = "grey20") +
+  scale_x_log10(breaks = c(0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1)) +
+  coord_cartesian(xlim = c(0.4, 1.15)) +
+  labs(x = "Hazard ratio (ultra-early vs early)", y = NULL) +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.y = element_blank())
+sfig6
+```
+
+## S-Figure 7: 56 time-zero definitions
+
+```{r sfig7, fig.width=12, fig.height=8}
+
+  sens_results <- readr::read_rds(
+    "/Users/nakashimatakaya/Desktop/SID/Data/Analysis_Data/cache_vp_secondary_20260223/sens_results_selfcontained.rds"
+  )
+sens_cap99 <- sens_results %>%
+  filter(str_detect(model, "cap99") | cap == "cap99")
+
+sens_plot <- sens_cap99 %>%
+  mutate(
+    facet_label = if_else(MODE == "rate", "NE infusion rate", "NE-equivalent dose"),
+    y_label = sprintf("\u2265%s, K=%d, W=%d",
+                      sub("^0", "", as.character(NE_THR)), SUSTAIN_K, SUSTAIN_WINDOW),
+    is_main = (NE_THR == 0.25 & SUSTAIN_K == 2 & SUSTAIN_WINDOW == 2 & MODE == "equiv"),
+    highlight = if_else(is_main, "Main analysis", "Alternative")
+  ) %>%
+  arrange(facet_label, HR) %>%
+  mutate(y_label = fct_inorder(y_label))
+
+sfig7 <- ggplot(sens_plot, aes(x = HR, y = y_label)) +
+  geom_rect(
+    data = sens_plot %>% filter(is_main),
+    aes(xmin = -Inf, xmax = Inf,
+        ymin = as.numeric(y_label) - 0.4,
+        ymax = as.numeric(y_label) + 0.4),
+    fill = "#FFFF99", alpha = 0.5, inherit.aes = FALSE
+  ) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey30") +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.3, linewidth = 0.3) +
+  geom_point(aes(shape = highlight), size = 1.8) +
+  scale_shape_manual(values = c("Main analysis" = 18, "Alternative" = 16)) +
+  facet_wrap(~ facet_label, scales = "free_y") +
+  scale_x_continuous(breaks = seq(0.2, 1.2, 0.2)) +
+  coord_cartesian(xlim = c(0.3, 1.15)) +
+  labs(x = "Hazard ratio (ultra-early vs early)", y = NULL, shape = NULL) +
+  theme_bw(base_size = 10) +
+  theme(strip.text = element_text(face = "bold", size = 11),
+        axis.text.y = element_text(size = 7),
+        panel.grid.minor = element_blank(), panel.grid.major.y = element_blank(),
+        legend.position = "top")
+sfig7
+```
+
+## S-Figure 8: Weighted NE trajectory
+
+```{r sfig8, fig.width=10, fig.height=6}
+uid_weights <- ccw_with_outcomes %>%
+  group_by(uid, arm) %>%
+  summarise(w = first(pmax(1e-6, pmin(weight, cap99_s))), .groups = "drop")
+
+ne_traj <- ts_tbl_data %>%
+  mutate(uid = str_c(src, all_id, sep = "::")) %>%
+  inner_join(pt_vp6 %>% select(uid, t0_hr) %>% distinct(), by = "uid") %>%
+  mutate(t_rel_hr = time_hr - t0_hr) %>%
+  filter(t_rel_hr >= 0, t_rel_hr <= 72, !is.na(norepi_equiv)) %>%
+  inner_join(uid_weights, by = "uid")
+
+ne_summary <- ne_traj %>%
+  mutate(t_bin = floor(t_rel_hr)) %>%
+  group_by(arm, t_bin) %>%
+  summarise(
+    ne_mean = weighted.mean(norepi_equiv, w, na.rm = TRUE),
+    ne_se = sqrt(sum(w * (norepi_equiv - weighted.mean(norepi_equiv, w, na.rm = TRUE))^2) /
+                   sum(w, na.rm = TRUE)) / sqrt(n()),
+    .groups = "drop"
+  ) %>%
+  mutate(arm_label = if_else(arm == "ultra", "0\u20133 h (ultra-early)", ">3\u20136 h (early)"))
+
+sfig8 <- ggplot(ne_summary, aes(x = t_bin, y = ne_mean, linetype = arm_label)) +
+  geom_ribbon(aes(ymin = ne_mean - ne_se, ymax = ne_mean + ne_se, fill = arm_label),
+              alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 0.8, colour = "black") +
+  scale_linetype_manual(values = c("0\u20133 h (ultra-early)" = "solid", ">3\u20136 h (early)" = "dashed")) +
+  scale_fill_manual(values = c("0\u20133 h (ultra-early)" = "grey30", ">3\u20136 h (early)" = "grey70")) +
+  labs(x = "Hours after time zero",
+       y = "Norepinephrine-equivalent dose (\u00b5g/kg/min)",
+       linetype = NULL, fill = NULL) +
+  theme_bw(base_size = 11) + theme(legend.position = "top")
+sfig8
+```
+
+# Supplementary Table 5: Weighted baseline characteristics
+
+```{r stable5}
+stbl5_data <- ccw_with_outcomes %>%
+  mutate(w_trunc = pmax(1e-6, pmin(weight, cap99_s)),
+         arm_label = if_else(arm == "ultra", "Ultra-early (0\u20133 h)", "Early (>3\u20136 h)"))
+
+stbl5_needed <- intersect(
+  c("age", "sex", "bmi", "wt0", "map0", "lact0", "sofa0", "crea0",
+    "norepi_equiv0", "mech_vent0", "steroid_pre"),
+  names(pt_vp6)
+)
+stbl5_missing <- setdiff(stbl5_needed, names(stbl5_data))
+if (length(stbl5_missing) > 0) {
+  stbl5_data <- stbl5_data %>%
+    left_join(pt_vp6 %>% select(uid, all_of(stbl5_missing)) %>% distinct(), by = "uid")
+}
+
+stbl5_data <- stbl5_data %>%
+  mutate(
+    steroid_pre = factor(as.integer(coalesce(as.logical(steroid_pre), FALSE)),
+                         levels = c(0L, 1L), labels = c("No", "Yes")),
+    mech_vent0_bin = factor(as.integer(as.character(mech_vent0) == "invasive"),
+                            levels = c(0L, 1L), labels = c("No", "Yes"))
+  )
+
+stbl5_vars <- intersect(
+  c("age", "sex", "bmi", "wt0", "map0", "lact0", "sofa0", "crea0",
+    "norepi_equiv0", "mech_vent0_bin", "steroid_pre"),
+  names(stbl5_data)
+)
+
+stbl5_labels <- list(
+  age = "Age, years", sex = "Sex",
+  bmi = "Body mass index, kg/m\u00b2", wt0 = "Body weight, kg",
+  map0 = "Mean arterial pressure, mmHg", lact0 = "Lactate, mmol/L",
+  sofa0 = "SOFA score", crea0 = "Creatinine, mg/dL",
+  norepi_equiv0 = "Norepinephrine-equivalent dose, \u00b5g/kg/min",
+  mech_vent0_bin = "Invasive mechanical ventilation",
+  steroid_pre = "Systemic corticosteroid use before time zero"
+)
+stbl5_labels <- stbl5_labels[intersect(names(stbl5_labels), stbl5_vars)]
+
+tbl_unwt <- stbl5_data %>%
+  select(arm_label, all_of(stbl5_vars)) %>%
+  tbl_summary(
+    by = arm_label, label = stbl5_labels,
+    statistic = list(all_continuous() ~ "{median} ({p25}, {p75})",
+                     all_categorical() ~ "{n} ({p}%)"),
+    digits = list(all_continuous() ~ 1, all_categorical() ~ c(0, 1)),
+    missing = "no"
+  ) %>%
+  modify_header(label = "**Variable**") %>%
+  modify_spanning_header(all_stat_cols() ~ "**Unweighted**") %>%
+  bold_labels()
+
+svy_data <- stbl5_data %>%
+  select(arm_label, w_trunc, all_of(stbl5_vars)) %>%
+  filter(!is.na(arm_label))
+svy_design <- svydesign(ids = ~1, weights = ~w_trunc, data = svy_data)
+
+tbl_wt <- svy_design %>%
+  tbl_svysummary(
+    by = arm_label, include = all_of(stbl5_vars), label = stbl5_labels,
+    statistic = list(all_continuous() ~ "{median} ({p25}, {p75})",
+                     all_categorical() ~ "{n} ({p}%)"),
+    digits = list(all_continuous() ~ 1, all_categorical() ~ c(0, 1)),
+    missing = "no"
+  ) %>%
+  modify_header(label = "**Variable**") %>%
+  modify_spanning_header(all_stat_cols() ~ "**Weighted (steroid-adjusted IPCW)**") %>%
+  bold_labels()
+
+tbl_merged <- tbl_merge(
+  tbls = list(tbl_unwt, tbl_wt),
+  tab_spanner = c("**Unweighted**", "**Weighted (steroid-adjusted IPCW)**")
+)
+tbl_merged
+```
+
+# Export to PowerPoint
+
+```{r pptx-export}
+ppt <- read_pptx()
+
+add_fig <- function(ppt, fig, title_text) {
+  ppt %>%
+    add_slide(layout = "Blank") %>%
+    ph_with(dml(ggobj = fig),
+            location = ph_location(left = 0.25, top = 0.25, width = 9.5, height = 7.0))
+}
+
+ppt <- add_fig(ppt, fig2_combined, "Figure 2")
+ppt <- add_fig(ppt, fig3, "Figure 3")
+ppt <- add_fig(ppt, sfig3, "S-Figure 3")
+ppt <- add_fig(ppt, sfig4, "S-Figure 4")
+ppt <- add_fig(ppt, sfig5, "S-Figure 5")
+ppt <- add_fig(ppt, sfig6, "S-Figure 6")
+ppt <- add_fig(ppt, sfig7, "S-Figure 7")
+ppt <- add_fig(ppt, sfig8, "S-Figure 8")
+
+print(ppt, target = PPTX_PATH)
+cat("All figures saved to:", PPTX_PATH, "\n")
+```
+
+# Export tables to Word
+
+```{r docx-export}
+# Table 1
+ft1 <- as_flex_table(tbl1) %>%
+  fontsize(size = 9, part = "all") %>%
+  autofit()
+
+doc1 <- read_docx() %>%
+  body_add_par(
+    "Table 1. Baseline characteristics and 28-day outcomes by observed vasopressin initiation timing",
+    style = "heading 1"
+  ) %>%
+  body_add_par(
+    paste0("Continuous variables are presented as median (interquartile range); ",
+           "categorical variables as n (%). ",
+           "28-day outcomes are crude (unweighted) event counts."),
+    style = "Normal"
+  ) %>%
+  body_add_flextable(ft1)
+print(doc1, target = DOCX_TABLE1)
+
+# S-Table 5
+ft_merged <- as_flex_table(tbl_merged) %>%
+  fontsize(size = 9, part = "all") %>%
+  autofit()
+
+doc5 <- read_docx() %>%
+  body_add_par(
+    "Supplementary Table 5. Baseline characteristics of the clone-expanded cohort before and after steroid-adjusted IPCW weighting",
+    style = "heading 1"
+  ) %>%
+  body_add_par(
+    paste0("Continuous variables are presented as median (interquartile range); ",
+           "categorical variables as n (%). ",
+           "Weights were estimated from an IPCW model that included systemic corticosteroid use ",
+           "before time zero as a baseline covariate."),
+    style = "Normal"
+  ) %>%
+  body_add_flextable(ft_merged)
+print(doc5, target = DOCX_STBL5)
+
+cat("All tables exported.\n")
+```
+
+# Session info
+
+```{r session}
+sessionInfo()
+```

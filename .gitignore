@@ -1,53 +1,19 @@
-# ============================================
-# Data — never commit (DUA violation)
-# ============================================
-*.rds
-*.csv
-*.csv.gz
-*.parquet
-*.sqlite
-*.db
-data/
-cache*/
-
-# ============================================
-# Output files (regenerable from code)
-# ============================================
-output/*.pptx
-output/*.docx
-output/*.pdf
-output/*.png
-output/*.jpg
-
-# ============================================
-# R / RStudio
-# ============================================
+.DS_Store
 .Rhistory
 .RData
 .Rproj.user/
-*.Rproj
-*_cache/
-*_files/
 *.html
-
-# ============================================
-# macOS
-# ============================================
-.DS_Store
-.AppleDouble
-.LSOverride
-._*
-
-# ============================================
-# Windows
-# ============================================
-Thumbs.db
-ehthumbs.db
-Desktop.ini
-
-# ============================================
-# Misc
-# ============================================
 *.log
-*.tmp
-*~
+*.rds
+*.Rds
+*.rda
+*.RData
+data/
+output/
+outputs/
+cache/
+*.pptx
+*.docx
+*.pdf
+*.png
+*.eps

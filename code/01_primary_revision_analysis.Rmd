@@ -1,0 +1,1405 @@
+---
+title: "ICM revision 追加解析（既刊パイプライン: ICU-based death + broken event）"
+subtitle: "MIMIC-IV + eICU-CRD, comorbidity-adjusted IPCW + 各種 sensitivity + 記述表 / 図"
+author: "Takaya Nakashima"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 10, fig.height = 7, dpi = 300,
+  cache = TRUE, cache.lazy = FALSE   # ts_imputed が大きいため lazy DB を無効化
+)
+```
+
+# 0. このRmdの方針
+
+- すべて **既刊（published）と同じ統計パイプライン**で走らせる。
+  - 死亡定義：ICU-based（`ts_out_orig` の `death_time` / `follow_end_rel`）
+  - Event 判定：broken（`event = death ≤ DAY28_HR`、人工的打ち切りで event を 0 にしない）
+  - 共変量フォーミュラ・IPCW・Cox の構造は既刊と同一
+- 追加するのは reviewer 要求の **解析の種類のみ**：
+  - メイン解析を comorbidity-adjusted IPCW に拡張
+  - NE-restricted / inotrope-excluded / baseline-only IPCW などの sensitivity
+  - Fine-Gray secondary outcomes（既刊原稿の Methods 記載に合わせる）
+  - Table 1 改訂、survivor/non-survivor、各種記述表、Figure 4
+- 「fixed event」「hospital-based death」の修正版は本 Rmd では一切扱わない。
+
+# 1. パッケージ・パス・パラメータ
+
+```{r libs}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(survival)
+  library(scales)
+  library(patchwork)
+  library(splines)
+  library(gtsummary)
+  library(flextable)
+  library(officer)
+  library(grid)
+})
+```
+
+```{r paths-params}
+DATA_DIR <- Sys.getenv("VP_ANALYSIS_DATA_DIR", unset = "path/to/analysis_data")
+REV_DIR  <- file.path(DATA_DIR, "revICM")
+OUT_DIR  <- Sys.getenv("VP_OUTPUT_DIR", unset = file.path(getwd(), "output"))
+fs::dir_create(OUT_DIR)
+
+IN_TS_OUT_REV <- file.path(REV_DIR, "vp_ts_out_revICM_20260517.rds")
+IN_PT_REV     <- file.path(REV_DIR, "vp_pt_revICM_20260517.rds")
+IN_TS_IMPUTED <- Sys.getenv(
+  "VP_TS_IMPUTED_RDS",
+  unset = file.path(DATA_DIR, "septic_shock_imputed_df_new")
+)
+IN_PT_SHINOZAKI <- Sys.getenv(
+  "VP_ELIGIBLE_PATIENT_RDS",
+  unset = file.path(DATA_DIR, "pt_all_eligible.rds")
+)
+
+DAY28_HR  <- 28 * 24
+EARLY_END <- 6
+P_CLIP    <- 1e-6
+SEED      <- 20260517
+B_BOOT    <- 500
+
+COL_ULTRA <- "#E24B4A"
+COL_EARLY <- "#185FA5"
+
+set.seed(SEED)
+```
+
+# 2. 入力読み込み
+
+```{r load-inputs}
+ts_out_rev <- readr::read_rds(IN_TS_OUT_REV)
+ts_imputed <- readr::read_rds(IN_TS_IMPUTED) %>%
+  mutate(uid = paste0(src, "::", as.character(all_id))) %>%
+  filter(src %in% c("miiv", "eicu"))
+
+# 既刊 cohort = shinozaki (5,215)
+pt_eligible_shinozaki <- readr::read_rds(IN_PT_SHINOZAKI) %>%
+  mutate(uid = if (!"uid" %in% names(.)) paste0(src, "::", all_id) else uid) %>%
+  filter(src %in% c("miiv", "eicu"))
+
+# revICM 前処理で個別保存した rds をすべて読み込み（uid 単位、ts_tbl の全患者をカバー）
+comorbidity_tbl    <- readr::read_rds(file.path(REV_DIR, "comorbidity_tbl.rds"))
+safety_tbl         <- readr::read_rds(file.path(REV_DIR, "safety_tbl.rds"))
+ne_flags_tbl       <- readr::read_rds(file.path(REV_DIR, "ne_flags_tbl.rds"))
+t0_neonly_tbl      <- readr::read_rds(file.path(REV_DIR, "t0_neonly_tbl.rds"))
+inotrope_flags_tbl <- readr::read_rds(file.path(REV_DIR, "inotrope_flags_tbl.rds"))
+vp_dose_tbl        <- readr::read_rds(file.path(REV_DIR, "vp_dose_tbl.rds"))
+vp_interrupt_tbl   <- readr::read_rds(file.path(REV_DIR, "vp_interrupt_tbl.rds"))
+fluid_summary_tbl  <- readr::read_rds(file.path(REV_DIR, "fluid_summary_tbl.rds"))
+steroid_timing_tbl <- readr::read_rds(file.path(REV_DIR, "steroid_timing_tbl.rds"))
+
+# uid 重複分布診断
+sz_uids   <- unique(pt_eligible_shinozaki$uid)
+ts_uids   <- unique(ts_out_rev$uid)
+cat("shinozaki uids:", length(sz_uids), "\n")
+cat("ts_out_rev uids:", length(ts_uids), "\n")
+cat("intersection:",   length(intersect(sz_uids, ts_uids)), "\n")
+cat("shinozaki only:", length(setdiff(sz_uids, ts_uids)), "\n")
+cat("ts_out_rev only:", length(setdiff(ts_uids, sz_uids)), "\n")
+
+# pt_rev は shinozaki を base にして、revICM 側で増えた変数だけ join する
+# secondary outcome time-to-event は ts_out_rev (= ts_out_orig 由来) から拾う
+ts_out_rev_secondary <- ts_out_rev %>%
+  select(uid, any_of(c(
+    "aki2_time", "aki3_time", "aki2_at0", "aki3_at0",
+    "rrt_time", "crrt_time", "rrt_pre", "crrt_pre",
+    "amio_time", "amio_pre",
+    "net_negative_time", "shock_resolve_time"
+  )))
+
+pt_rev <- pt_eligible_shinozaki %>%
+  distinct(uid, .keep_all = TRUE) %>%
+  left_join(comorbidity_tbl,    by = "uid") %>%
+  left_join(safety_tbl,         by = "uid") %>%
+  left_join(ne_flags_tbl,       by = "uid") %>%
+  left_join(t0_neonly_tbl,      by = "uid") %>%
+  left_join(inotrope_flags_tbl, by = "uid") %>%
+  left_join(vp_dose_tbl,        by = "uid") %>%
+  left_join(vp_interrupt_tbl,   by = "uid") %>%
+  left_join(fluid_summary_tbl,  by = "uid") %>%
+  left_join(steroid_timing_tbl, by = "uid") %>%
+  left_join(ts_out_rev_secondary, by = "uid") %>%
+  # 欠測 logical → FALSE
+  mutate(
+    across(starts_with("cc_"), ~ coalesce(.x, FALSE)),
+    across(starts_with("sf_"), ~ coalesce(.x, FALSE)),
+    across(c(any_of(c("ne_at_t0", "ne_first", "ne_dominant_080", "ne_dominant_090",
+                      "dobu_at_t0", "dobu_window06", "dobu_pre_t0_24h",
+                      "dobu_at_vp", "epi_at_vp",
+                      "new_dobu_3h", "new_dobu_6h", "new_dobu_24h", "new_epi_24h",
+                      "interrupt_3h", "sustained_interrupt_6h", "permanent_disc_3h",
+                      "vp_init_lt003", "vp_init_eq003", "vp_init_gt003", "vp_dose_missing",
+                      "steroid_pre_t0_24h", "steroid_pre_vp", "steroid_post_vp",
+                      "aki2_at0", "aki3_at0", "rrt_pre", "crrt_pre", "amio_pre"))),
+           ~ coalesce(.x, FALSE))
+  )
+
+# 既存解析と同じ tvp_rel を改めて確保（shinozaki の値を採用）
+tvp_rel_pub_tbl <- pt_eligible_shinozaki %>%
+  distinct(uid, .keep_all = TRUE) %>%
+  transmute(uid, tvp_rel_pub = as.numeric(tvp_rel))
+
+cat("pt_rev (shinozaki base) N =", nrow(pt_rev), "\n")
+cat("comorbidity 欠測数:", sum(is.na(pt_rev$cc_chronic_cardiac)), "\n")
+cat("aki2_time 欠測数:",   sum(is.na(pt_rev$aki2_time)), "\n")
+```
+
+# 3. Pre-analysis 設定（pt_all_eligible）
+
+既刊パイプラインに合わせ、`death_time` / `follow_end_rel` は `ts_out_orig` 由来（ICU-based）をそのまま使う。`tvp_rel` は shinozaki rds の値で上書き。
+
+```{r pt-all-eligible}
+# 診断: filter 前の NA 状況を確認
+cat("=== pt_rev (shinozaki base) の状況 ===\n")
+cat("pt_rev N:", nrow(pt_rev), "\n")
+cat("  t0_hr が NA:",        sum(is.na(pt_rev$t0_hr)),       "\n")
+cat("  death_time が NA:",   sum(is.na(pt_rev$death_time)),  "\n")
+cat("  follow_end_rel NA:",  sum(is.na(pt_rev$follow_end_rel)), "\n")
+cat("  tvp_rel が NA:",      sum(is.na(pt_rev$tvp_rel)),     "\n")
+cat("  tvp_rel < 0:",        sum(pt_rev$tvp_rel < 0, na.rm = TRUE), "\n")
+
+pt_all_eligible <- pt_rev %>%
+  mutate(
+    # shinozaki 由来をそのまま使う（既刊と完全整合）
+    t0_hr      = as.numeric(t0_hr),
+    death_rel  = as.numeric(death_time),
+    death_time = as.numeric(death_time),
+    follow_end_rel = pmin(as.numeric(follow_end_rel), DAY28_HR, na.rm = TRUE),
+    tvp_rel    = as.numeric(tvp_rel)
+  ) %>%
+  # shinozaki が負の tvp_rel を入れていた場合のみ除外（VP-before-t0）
+  filter(is.na(tvp_rel) | tvp_rel >= 0) %>%
+  # t0_hr が NA の患者は解析不可
+  filter(!is.na(t0_hr))
+
+cat("\npt_all_eligible N:", nrow(pt_all_eligible), "\n")
+
+# 観察された VP timing group
+pt_all_eligible <- pt_all_eligible %>%
+  mutate(
+    obs_vp_group = case_when(
+      is.na(tvp_rel)                ~ "never_vp",
+      tvp_rel <= 3                  ~ "0-3h",
+      tvp_rel >  3 & tvp_rel <= 6   ~ ">3-6h",
+      tvp_rel >  6                  ~ ">6h",
+      TRUE                          ~ NA_character_
+    ),
+    obs_vp_group = factor(obs_vp_group,
+                          levels = c("0-3h", ">3-6h", ">6h", "never_vp"))
+  )
+
+# baseline 派生（wt0 / mech_vent0_inv）
+if (!"wt0" %in% names(pt_all_eligible) && "weight" %in% names(pt_all_eligible)) {
+  pt_all_eligible$wt0 <- pt_all_eligible$weight
+}
+if ("mech_vent0_bin" %in% names(pt_all_eligible)) {
+  pt_all_eligible$mech_vent0_inv <-
+    as.integer(coalesce(as.integer(pt_all_eligible$mech_vent0_bin), 0L))
+} else {
+  mvc <- as.character(pt_all_eligible$mech_vent0)
+  pt_all_eligible$mech_vent0_inv <-
+    as.integer(!is.na(mvc) & mvc %in% c("invasive", "1", "TRUE", "True", "T"))
+}
+
+pt_all_eligible <- pt_all_eligible %>%
+  mutate(
+    age = as.numeric(age),
+    bmi = as.numeric(bmi),
+    wt0 = as.numeric(wt0),
+    sex = as.character(sex)
+  )
+
+# ICU-based death28 を作成（既刊と同じ）
+pt_all_eligible <- pt_all_eligible %>%
+  mutate(
+    death28 = !is.na(death_time) & is.finite(death_time) &
+              death_time >= 0 & death_time <= DAY28_HR,
+    # subgroup analysis 用 lactate stratum を pt-all-eligible chunk 内で定義
+    # （subgroup chunk で pt_all_eligible を再代入しないため、cache 問題を回避）
+    lact_stratum = case_when(
+      is.na(lact0) ~ NA_character_,
+      lact0 <  2   ~ "lt2",
+      lact0 <  4   ~ "2to4",
+      TRUE         ~ "ge4"
+    )
+  )
+```
+
+# 4. CCW pipeline をモジュール化（既刊パイプライン = broken event）
+
+```{r ccw-pipeline-functions}
+# ----------------------------------------------------------------
+# 4.1 Clone + censor_time + end_time
+# ----------------------------------------------------------------
+build_clones <- function(pt_cohort, tvp_var = "tvp_rel",
+                         strategy_ultra_h = 3, strategy_early_h = 6) {
+  base <- pt_cohort %>%
+    rename(.tvp_rel = !!sym(tvp_var)) %>%
+    mutate(.tvp_rel = as.numeric(.tvp_rel))
+
+  bind_rows(
+    base %>% mutate(arm = "ultra"),
+    base %>% mutate(arm = "early")
+  ) %>%
+    mutate(
+      arm = factor(arm, levels = c("early", "ultra")),
+      censor_time = case_when(
+        arm == "ultra" & (is.na(.tvp_rel) | .tvp_rel > strategy_ultra_h) ~ strategy_ultra_h,
+        arm == "early" & !is.na(.tvp_rel) & .tvp_rel <= strategy_ultra_h ~ .tvp_rel,
+        arm == "early" & (is.na(.tvp_rel) | .tvp_rel > strategy_early_h) ~ strategy_early_h,
+        TRUE ~ Inf
+      ),
+      end_time = pmin(censor_time, coalesce(death_rel, Inf),
+                      strategy_early_h, na.rm = TRUE),
+      tvp_rel  = .tvp_rel
+    ) %>%
+    select(-.tvp_rel)
+}
+
+# ----------------------------------------------------------------
+# 4.2 Grace panel（baseline + hourly time-varying covariate）
+# ----------------------------------------------------------------
+build_grace_panel <- function(pt_clone, ts_imp, t0_var = "t0_hr",
+                              early_end_h = EARLY_END) {
+  ts_grace_cov <- ts_imp %>%
+    inner_join(pt_clone %>% select(uid, !!sym(t0_var)) %>% distinct(),
+               by = "uid") %>%
+    rename(.t0 = !!sym(t0_var)) %>%
+    mutate(t_rel = time_hr - .t0,
+           t     = as.integer(round(t_rel))) %>%
+    filter(t >= 0, t <= (early_end_h - 1)) %>%
+    group_by(uid, t) %>%
+    summarise(
+      map = first(map), lact = first(lact), crea = first(crea),
+      norepi_equiv = first(norepi_equiv), sofa = first(sofa),
+      mech_vent = first(mech_vent),
+      epi_rate = first(epi_rate), dopa_rate = first(dopa_rate),
+      dobu_rate = first(dobu_rate), phn_rate = first(phn_rate),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      mech_vent_inv = as.integer(coalesce(mech_vent == "invasive", FALSE))
+    ) %>%
+    group_by(uid) %>% arrange(t) %>%
+    mutate(
+      ne0_panel  = first(norepi_equiv),
+      ne_from0   = norepi_equiv - ne0_panel,
+      ne_delta1  = norepi_equiv - lag(norepi_equiv)
+    ) %>%
+    ungroup()
+
+  ccw_grace <- pt_clone %>%
+    tidyr::crossing(t = 0:(early_end_h - 1)) %>%
+    filter(t < end_time) %>%
+    left_join(ts_grace_cov, by = c("uid", "t")) %>%
+    mutate(
+      censor_next = is.finite(censor_time) & ((t + 1) >= ceiling(censor_time)) &
+                    (t + 1 <= censor_time + 1e-9),
+      death_next  = !is.na(death_rel) & is.finite(death_rel) &
+                    ((t + 1) >= ceiling(death_rel)),
+      age_miss  = as.integer(is.na(age)),   age_imp  = replace_na(as.numeric(age), 0),
+      bmi_miss  = as.integer(is.na(bmi)),   bmi_imp  = replace_na(as.numeric(bmi), 0),
+      wt0_miss  = as.integer(is.na(wt0)),   wt0_imp  = replace_na(as.numeric(wt0), 0),
+      map_miss  = as.integer(is.na(map)),   map_imp  = replace_na(as.numeric(map), 0),
+      lact_miss = as.integer(is.na(lact)),  lact_imp = replace_na(as.numeric(lact), 0),
+      crea_miss = as.integer(is.na(crea)),  crea_imp = replace_na(as.numeric(crea), 0),
+      ne_miss   = as.integer(is.na(norepi_equiv)),
+      ne_imp    = replace_na(as.numeric(norepi_equiv), 0),
+      sofa_miss = as.integer(is.na(sofa)),  sofa_imp = replace_na(as.numeric(sofa), 0),
+      ne_from0_miss  = as.integer(is.na(ne_from0)),
+      ne_from0_imp   = replace_na(as.numeric(ne_from0), 0),
+      ne_delta1_miss = as.integer(is.na(ne_delta1)),
+      ne_delta1_imp  = replace_na(as.numeric(ne_delta1), 0),
+      epi_miss  = as.integer(is.na(epi_rate)),  epi_imp  = replace_na(as.numeric(epi_rate), 0),
+      dopa_miss = as.integer(is.na(dopa_rate)), dopa_imp = replace_na(as.numeric(dopa_rate), 0),
+      dobu_miss = as.integer(is.na(dobu_rate)), dobu_imp = replace_na(as.numeric(dobu_rate), 0),
+      phn_miss  = as.integer(is.na(phn_rate)),  phn_imp  = replace_na(as.numeric(phn_rate), 0),
+      steroid_pre = if ("steroid_pre" %in% names(.))
+                      replace_na(as.integer(steroid_pre), 0L)
+                    else
+                      replace_na(as.integer(steroid_pre_t0_24h), 0L),
+      across(starts_with("cc_"), ~ as.integer(coalesce(.x, FALSE)))
+    )
+  ccw_grace
+}
+
+# ----------------------------------------------------------------
+# 4.3 IPCW fit（共変量フォーミュラ差し替え可能）
+# ----------------------------------------------------------------
+fit_ipcw_arm <- function(dat_arm, f_num, f_den) {
+  if (sum(dat_arm$censor_next, na.rm = TRUE) < 2) {
+    dat_arm$w_ipcw <- 1; dat_arm$w_cum <- 1; dat_arm$w_final <- 1
+    return(dat_arm)
+  }
+  fit_num <- glm(f_num, data = dat_arm, family = binomial(),
+                 control = glm.control(maxit = 50))
+  fit_den <- glm(f_den, data = dat_arm, family = binomial(),
+                 control = glm.control(maxit = 50))
+  p_num <- pmin(pmax(predict(fit_num, type = "response"), P_CLIP), 1 - P_CLIP)
+  p_den <- pmin(pmax(predict(fit_den, type = "response"), P_CLIP), 1 - P_CLIP)
+  dat_arm %>%
+    mutate(w_ratio = (1 - p_num) / (1 - p_den)) %>%
+    group_by(uid, arm) %>% arrange(t) %>%
+    mutate(
+      w_cum   = cumprod(w_ratio),
+      w_ipcw  = lag(w_cum, default = 1),
+      w_final = last(w_cum)
+    ) %>%
+    ungroup()
+}
+
+fit_ipcw_both <- function(ccw_grace, den_terms, num_terms = "ns(t, 3)") {
+  f_num <- as.formula(paste0("censor_next ~ ", num_terms))
+  f_den <- as.formula(paste0("censor_next ~ ", paste(c(num_terms, den_terms),
+                                                     collapse = " + ")))
+  dat <- ccw_grace %>% filter(death_next == FALSE)
+  w_u <- fit_ipcw_arm(dat %>% filter(arm == "ultra"), f_num, f_den)
+  w_e <- fit_ipcw_arm(dat %>% filter(arm == "early"), f_num, f_den)
+  bind_rows(w_u, w_e)
+}
+
+# ----------------------------------------------------------------
+# 4.4 既刊スタイル terminal CCW table（broken event 版）
+#     - art_censor は tstop / event の制約に入れない
+#     - event = death ≤ DAY28_HR
+# ----------------------------------------------------------------
+build_ccw_terminal <- function(w_grace, day28_hr = DAY28_HR,
+                               outcome_time_var = "death_rel") {
+  w_grace %>%
+    group_by(uid, arm) %>%
+    arrange(desc(t)) %>%
+    slice(1) %>%
+    ungroup() %>%
+    mutate(
+      out_time_raw = .data[[outcome_time_var]],
+      out_time = if_else(is.na(out_time_raw) | is.infinite(out_time_raw),
+                         Inf, out_time_raw),
+      adm_censor = coalesce(follow_end_rel, day28_hr),
+      tstop  = pmin(out_time, adm_censor, day28_hr, na.rm = TRUE),
+      event  = is.finite(out_time_raw) & out_time_raw <= day28_hr,
+      weight = w_final,
+      tstart = 0
+    )
+}
+
+# ----------------------------------------------------------------
+# 4.5 重み付き Cox の HR 抽出
+# ----------------------------------------------------------------
+run_cox_w <- function(ccw_tbl, cap_val, label,
+                      strata_term = "strata(src)",
+                      extra_term  = NULL) {
+  dat <- ccw_tbl %>%
+    mutate(
+      w   = pmax(P_CLIP, pmin(weight, cap_val)),
+      src = factor(src),
+      arm = factor(arm, levels = c("early", "ultra"))
+    )
+  rhs <- paste(c("arm", strata_term, extra_term), collapse = " + ")
+  fit <- coxph(as.formula(paste0("Surv(tstart, tstop, event) ~ ", rhs)),
+               data = dat, weights = w, robust = TRUE, cluster = uid)
+  ci <- summary(fit)$conf.int["armultra", , drop = FALSE]
+  tibble(
+    label = label,
+    HR    = ci[1, "exp(coef)"],
+    lower = ci[1, "lower .95"],
+    upper = ci[1, "upper .95"],
+    n_clone = nrow(dat),
+    n_event = sum(dat$event)
+  )
+}
+
+get_caps <- function(ccw_tbl) {
+  list(
+    cap99 = as.numeric(quantile(ccw_tbl$weight, 0.99, na.rm = TRUE)),
+    cap95 = as.numeric(quantile(ccw_tbl$weight, 0.95, na.rm = TRUE))
+  )
+}
+
+# ----------------------------------------------------------------
+# 4.6 cohort × covariate set を差し替えて pipeline を回す
+# ----------------------------------------------------------------
+run_pipeline <- function(pt_sub, t0_var = "t0_hr", den_terms,
+                         label = "") {
+  if (nrow(pt_sub) < 20) {
+    return(tibble(label = label, HR = NA_real_, lower = NA_real_, upper = NA_real_,
+                  n_clone = 0, n_event = 0))
+  }
+  pt_clone_s   <- build_clones(pt_sub, "tvp_rel", 3, EARLY_END)
+  ccw_grace_s  <- build_grace_panel(pt_clone_s, ts_imputed, t0_var, EARLY_END)
+  w_grace_s    <- fit_ipcw_both(ccw_grace_s, den_terms = den_terms)
+  ccw_tbl_s    <- build_ccw_terminal(w_grace_s, DAY28_HR, "death_rel")
+  caps_s       <- get_caps(ccw_tbl_s)
+  run_cox_w(ccw_tbl_s, caps_s$cap99, label)
+}
+```
+
+# 5. 共変量セット定義
+
+```{r covariate-sets}
+# (A) 既刊（comorbidity なし）
+COV_ORIGINAL <- c(
+  "sex", "src",
+  "age_imp", "age_miss", "bmi_imp", "bmi_miss", "wt0_imp", "wt0_miss",
+  "map_imp", "map_miss", "lact_imp", "lact_miss", "crea_imp", "crea_miss",
+  "ne_imp", "ne_miss",
+  "ne_from0_imp", "ne_from0_miss", "ne_delta1_imp", "ne_delta1_miss",
+  "epi_imp", "epi_miss", "dopa_imp", "dopa_miss",
+  "dobu_imp", "dobu_miss",
+  "phn_imp", "phn_miss",
+  "sofa_imp", "sofa_miss", "mech_vent_inv", "steroid_pre"
+)
+
+# (B) Comorbidity-adjusted（メイン）
+COV_COMORB <- c(
+  COV_ORIGINAL,
+  "cc_chronic_cardiac", "cc_hypertension", "cc_ckd",
+  "cc_diabetes", "cc_malignancy", "cc_hiv", "cc_dementia"
+)
+
+# (C) Baseline-only IPCW（time-varying physio を除く）
+COV_BASELINE_ONLY <- c(
+  "sex", "src",
+  "age_imp", "age_miss", "bmi_imp", "bmi_miss", "wt0_imp", "wt0_miss",
+  "steroid_pre",
+  "cc_chronic_cardiac", "cc_hypertension", "cc_ckd",
+  "cc_diabetes", "cc_malignancy", "cc_hiv", "cc_dementia"
+)
+
+# (D) Inotrope（dobutamine）共変量を除外
+COV_NO_INOTROPE <- setdiff(COV_COMORB, c("dobu_imp", "dobu_miss"))
+```
+
+# 6. メイン pipeline 実行（comorbidity-adjusted）
+
+```{r ccw-main}
+pt_clone_main  <- build_clones(pt_all_eligible, "tvp_rel", 3, EARLY_END)
+ccw_grace_main <- build_grace_panel(pt_clone_main, ts_imputed, "t0_hr", EARLY_END)
+
+# IPCW (comorbidity-adjusted)
+w_grace_main <- fit_ipcw_both(ccw_grace_main, den_terms = COV_COMORB)
+ccw_tbl_main <- build_ccw_terminal(w_grace_main, DAY28_HR, "death_rel")
+caps_main    <- get_caps(ccw_tbl_main)
+
+# 比較用に COV_ORIGINAL (既刊と同じ) も並走させる
+w_grace_orig <- fit_ipcw_both(ccw_grace_main, den_terms = COV_ORIGINAL)
+ccw_tbl_orig <- build_ccw_terminal(w_grace_orig, DAY28_HR, "death_rel")
+caps_orig    <- get_caps(ccw_tbl_orig)
+
+cat("Main IPCW cap99:", round(caps_main$cap99, 3),
+    " cap95:", round(caps_main$cap95, 3), "\n")
+```
+
+# 7. Primary Cox
+
+```{r primary-cox}
+res_original     <- run_cox_w(ccw_tbl_orig, caps_orig$cap99,
+                              "Original IPCW (no comorbidity, ≈ published)")
+res_primary_99   <- run_cox_w(ccw_tbl_main, caps_main$cap99,
+                              "Main (comorbidity-adjusted IPCW, 99th-percentile truncation)")
+res_primary_95   <- run_cox_w(ccw_tbl_main, caps_main$cap95,
+                              "Main (comorbidity-adjusted IPCW, 95th-percentile truncation)")
+
+primary_results <- bind_rows(res_original, res_primary_99, res_primary_95)
+readr::write_csv(primary_results, file.path(OUT_DIR, "results_primary.csv"))
+print(primary_results)
+```
+
+# 8. Sensitivity #1: Baseline-only IPCW（R2 Major 2）
+
+```{r sens-baseline-only}
+w_grace_bl <- fit_ipcw_both(ccw_grace_main, den_terms = COV_BASELINE_ONLY)
+ccw_tbl_bl <- build_ccw_terminal(w_grace_bl, DAY28_HR, "death_rel")
+caps_bl    <- get_caps(ccw_tbl_bl)
+res_baseline_only <- run_cox_w(ccw_tbl_bl, caps_bl$cap99, "Baseline-only IPCW")
+print(res_baseline_only)
+```
+
+# 9. Sensitivity #2-5: NE-restricted cohort（R1 Major 1）
+
+```{r sens-ne-restricted}
+res_ne_at_t0 <- run_pipeline(
+  pt_all_eligible %>% filter(ne_at_t0),
+  den_terms = COV_COMORB,
+  label = "NE at time zero (norepi_rate > 0 at t0)"
+)
+res_ne_first <- run_pipeline(
+  pt_all_eligible %>% filter(ne_first),
+  den_terms = COV_COMORB,
+  label = "NE-first (first vasopressor = norepinephrine)"
+)
+res_ne_dom80 <- run_pipeline(
+  pt_all_eligible %>% filter(ne_dominant_080),
+  den_terms = COV_COMORB,
+  label = "NE-dominant (NE rate ≥ 80% of NEE at t0)"
+)
+
+# NE-only time zero: t0 を NE rate alone で再定義
+pt_neonly <- pt_all_eligible %>%
+  filter(!is.na(t0_hr_neonly)) %>%
+  mutate(
+    t0_shift   = t0_hr - t0_hr_neonly,    # 通常 0 または +1, +2
+    t0_hr      = t0_hr_neonly,
+    death_rel  = death_rel + t0_shift,
+    follow_end_rel = pmin(follow_end_rel + t0_shift, DAY28_HR, na.rm = TRUE)
+  )
+res_ne_only <- run_pipeline(
+  pt_neonly, den_terms = COV_COMORB,
+  label = "NE-only time zero (NE rate ≥ 0.25 µg/kg/min)"
+)
+
+ne_sens_results <- bind_rows(res_ne_at_t0, res_ne_first, res_ne_dom80, res_ne_only)
+readr::write_csv(ne_sens_results, file.path(OUT_DIR, "results_ne_sensitivity.csv"))
+print(ne_sens_results)
+```
+
+# 10. Sensitivity #6-8: Inotrope-excluded（R1 Major 2）
+
+```{r sens-inotrope}
+res_excl_dobu_t0 <- run_pipeline(
+  pt_all_eligible %>% filter(!coalesce(dobu_at_t0, FALSE)),
+  den_terms = COV_COMORB,
+  label = "Exclude dobutamine at time zero"
+)
+res_excl_dobu_win <- run_pipeline(
+  pt_all_eligible %>% filter(!coalesce(dobu_window06, FALSE)),
+  den_terms = COV_COMORB,
+  label = "Exclude dobutamine during 0-6h window"
+)
+res_no_dobu_cov <- run_pipeline(
+  pt_all_eligible, den_terms = COV_NO_INOTROPE,
+  label = "Censoring model without dobutamine covariate"
+)
+
+inotrope_sens_results <- bind_rows(res_excl_dobu_t0, res_excl_dobu_win, res_no_dobu_cov)
+readr::write_csv(inotrope_sens_results, file.path(OUT_DIR, "results_inotrope_sensitivity.csv"))
+print(inotrope_sens_results)
+```
+
+# 11. Sensitivity summary
+
+```{r sens-summary}
+sens_summary <- bind_rows(
+  res_original, res_primary_99, res_primary_95,
+  res_baseline_only,
+  ne_sens_results, inotrope_sens_results
+)
+readr::write_csv(sens_summary, file.path(OUT_DIR, "results_sensitivity_all.csv"))
+print(sens_summary)
+```
+
+# 12. Secondary outcomes: IPCW-weighted Fine-Gray（R2 Major 3）
+
+```{r fine-gray-secondaries}
+run_finegray_one <- function(w_grace_in, time_var, flag_var, label,
+                             cap_val = NULL) {
+  base <- w_grace_in %>%
+    group_by(uid, arm) %>%
+    arrange(desc(t)) %>%
+    slice(1) %>%
+    ungroup() %>%
+    mutate(
+      out_time_raw = .data[[time_var]],
+      out_time = if_else(is.na(out_time_raw) | is.infinite(out_time_raw),
+                         Inf, out_time_raw),
+      death_t = if_else(is.na(death_rel) | is.infinite(death_rel), Inf, death_rel),
+      adm_censor = coalesce(follow_end_rel, DAY28_HR),
+      event_int   = is.finite(out_time_raw) & out_time_raw <= DAY28_HR &
+                    out_time_raw < death_t & coalesce(.data[[flag_var]], FALSE),
+      event_death = is.finite(death_t) & death_t <= DAY28_HR &
+                    death_t <= out_time_raw,
+      status = case_when(
+        event_int   ~ 1L,
+        event_death ~ 2L,
+        TRUE        ~ 0L
+      ),
+      tstop  = pmin(out_time, death_t, adm_censor, DAY28_HR, na.rm = TRUE),
+      tstart = 0,
+      weight = w_final
+    ) %>%
+    filter(tstop > 0) %>%
+    mutate(arm = factor(arm, levels = c("early", "ultra")),
+           src = factor(src),
+           status_f = factor(status, levels = 0:2,
+                             labels = c("censor", "event", "cmprsk")))
+
+  if (sum(base$status == 1) < 10) {
+    return(tibble(label = label, HR = NA_real_, lower = NA_real_, upper = NA_real_,
+                  n_clone = nrow(base), n_event = sum(base$status == 1)))
+  }
+  if (is.null(cap_val)) cap_val <- quantile(base$weight, 0.99, na.rm = TRUE)
+  base <- base %>% mutate(w = pmax(P_CLIP, pmin(weight, cap_val)))
+
+  fg <- finegray(Surv(tstop, status_f) ~ ., data = base, etype = "event",
+                 weights = w)
+  fit <- coxph(Surv(fgstart, fgstop, fgstatus) ~ arm + strata(src),
+               data = fg, weights = fgwt, robust = TRUE, cluster = uid)
+  ci <- summary(fit)$conf.int["armultra", , drop = FALSE]
+  tibble(label = label,
+         HR    = ci[1, "exp(coef)"],
+         lower = ci[1, "lower .95"],
+         upper = ci[1, "upper .95"],
+         n_clone = nrow(base),
+         n_event = sum(base$status == 1))
+}
+
+# Secondary outcome の time / flag を pt_all_eligible から attach
+secondary_outcome_attach <- pt_all_eligible %>%
+  transmute(
+    uid,
+    aki2_time_sec   = aki2_time,
+    aki3_time_sec   = aki3_time,
+    rrt_time_sec    = rrt_time,
+    crrt_time_sec   = crrt_time,
+    antiarr_time_sec = amio_time,
+    netneg_time_sec = net_negative_time,
+    aki2_flag    = !is.na(aki2_time) & !coalesce(aki2_at0, FALSE),
+    aki3_flag    = !is.na(aki3_time) & !coalesce(aki3_at0, FALSE),
+    rrt_flag     = !is.na(rrt_time)  & !coalesce(rrt_pre, FALSE),
+    crrt_flag    = !is.na(crrt_time) & !coalesce(crrt_pre, FALSE),
+    antiarr_flag = !is.na(amio_time) & !coalesce(amio_pre, FALSE),
+    netneg_flag  = !is.na(net_negative_time)
+  )
+
+# 列衝突を避けるため _sec サフィックスで attach
+w_grace_with_sec <- w_grace_main %>%
+  left_join(secondary_outcome_attach, by = "uid")
+
+res_aki2   <- run_finegray_one(w_grace_with_sec, "aki2_time_sec",
+                               "aki2_flag",    "AKI (KDIGO ≥2)")
+res_aki3   <- run_finegray_one(w_grace_with_sec, "aki3_time_sec",
+                               "aki3_flag",    "AKI (KDIGO ≥3)")
+res_rrt    <- run_finegray_one(w_grace_with_sec, "rrt_time_sec",
+                               "rrt_flag",     "RRT initiation")
+res_crrt   <- run_finegray_one(w_grace_with_sec, "crrt_time_sec",
+                               "crrt_flag",    "CRRT initiation")
+res_arr    <- run_finegray_one(w_grace_with_sec, "antiarr_time_sec",
+                               "antiarr_flag", "Medically treated arrhythmia")
+res_netneg <- run_finegray_one(w_grace_with_sec, "netneg_time_sec",
+                               "netneg_flag",  "Net negative fluid balance")
+
+secondary_finegray <- bind_rows(res_aki2, res_aki3, res_rrt, res_crrt,
+                                res_arr, res_netneg)
+readr::write_csv(secondary_finegray,
+                 file.path(OUT_DIR, "results_secondary_finegray.csv"))
+print(secondary_finegray)
+```
+
+# 13. Subgroup analyses with interaction P
+
+```{r subgroup}
+# lact_stratum は pt-all-eligible chunk で既に定義済み（cache 問題回避のため）
+# ここでは pt_all_eligible を再代入せず、必要な変数を取り出すだけ
+strata_join <- pt_all_eligible %>%
+  select(uid, lact_stratum, sofa0, ne0, lact0,
+         steroid_pre, mech_vent0_inv)
+
+ccw_tbl_main2 <- ccw_tbl_main %>%
+  left_join(strata_join, by = "uid", suffix = c("", ".dup")) %>%
+  mutate(
+    lact_ge4 = case_when(
+      is.na(lact0) ~ NA_integer_, lact0 >= 4 ~ 1L, TRUE ~ 0L),
+    ne_high_030 = case_when(
+      is.na(ne0)  ~ NA_integer_, ne0 >= 0.30 ~ 1L, TRUE ~ 0L),
+    sofa_ge14 = case_when(
+      is.na(sofa0) ~ NA_integer_, sofa0 >= 14 ~ 1L, TRUE ~ 0L)
+  )
+
+run_subgroup_interaction <- function(ccw_tbl, sub_var, label) {
+  dat <- ccw_tbl %>%
+    mutate(
+      w = pmax(P_CLIP, pmin(weight, caps_main$cap99)),
+      arm = factor(arm, levels = c("early", "ultra")),
+      src = factor(src),
+      .sub = .data[[sub_var]]
+    ) %>%
+    filter(!is.na(.sub))
+
+  if (is.logical(dat$.sub)) dat$.sub <- as.integer(dat$.sub)
+  if (!is.numeric(dat$.sub)) dat$.sub <- factor(dat$.sub)
+
+  fit_int <- coxph(Surv(tstart, tstop, event) ~ arm * .sub + strata(src),
+                   data = dat, weights = w, robust = TRUE, cluster = uid)
+  coef_int_name <- grep(":", names(coef(fit_int)), value = TRUE)
+  vc <- vcov(fit_int); est <- coef(fit_int)[coef_int_name]
+  V  <- vc[coef_int_name, coef_int_name, drop = FALSE]
+  if (length(est) == 1) {
+    p_int <- 2 * pnorm(-abs(est / sqrt(V)))
+  } else {
+    chi <- as.numeric(t(est) %*% solve(V) %*% est)
+    p_int <- pchisq(chi, df = length(est), lower.tail = FALSE)
+  }
+  tibble(label = label, sub_var = sub_var, interaction_p = as.numeric(p_int))
+}
+
+sub_lactate <- run_subgroup_interaction(ccw_tbl_main2, "lact_stratum",
+                                        "Lactate stratum (<2 / 2-<4 / ≥4)")
+sub_ne      <- run_subgroup_interaction(ccw_tbl_main2, "ne_high_030",
+                                        "NE-equivalent dose ≥ 0.30")
+sub_steroid <- run_subgroup_interaction(ccw_tbl_main2, "steroid_pre",
+                                        "Baseline steroid (orders-based, pre-t0 24h)")
+sub_mv      <- run_subgroup_interaction(ccw_tbl_main2, "mech_vent0_inv",
+                                        "Invasive mechanical ventilation")
+
+subgroup_interactions <- bind_rows(sub_lactate, sub_ne, sub_steroid, sub_mv)
+readr::write_csv(subgroup_interactions,
+                 file.path(OUT_DIR, "results_subgroup_interaction.csv"))
+print(subgroup_interactions)
+
+# stratum 内の HR
+run_within_stratum <- function(ccw_tbl, stratum_var) {
+  ccw_tbl %>%
+    filter(!is.na(.data[[stratum_var]])) %>%
+    group_by(.stratum = .data[[stratum_var]]) %>%
+    group_modify(~ {
+      d <- .x %>%
+        mutate(w   = pmax(P_CLIP, pmin(weight, caps_main$cap99)),
+               arm = factor(arm, levels = c("early", "ultra")),
+               src = factor(src))
+      if (length(unique(d$src)) < 2) {
+        fit <- coxph(Surv(tstart, tstop, event) ~ arm,
+                     data = d, weights = w, robust = TRUE, cluster = uid)
+      } else {
+        fit <- coxph(Surv(tstart, tstop, event) ~ arm + strata(src),
+                     data = d, weights = w, robust = TRUE, cluster = uid)
+      }
+      ci <- summary(fit)$conf.int["armultra", , drop = FALSE]
+      tibble(HR = ci[1, "exp(coef)"], lower = ci[1, "lower .95"],
+             upper = ci[1, "upper .95"],
+             n_clone = nrow(d), n_event = sum(d$event))
+    }) %>%
+    ungroup() %>%
+    mutate(.stratum    = as.character(.stratum),
+           stratum_var = stratum_var)
+}
+
+within_lactate <- run_within_stratum(ccw_tbl_main2, "lact_stratum")
+within_ne      <- run_within_stratum(ccw_tbl_main2, "ne_high_030")
+within_steroid <- run_within_stratum(ccw_tbl_main2, "steroid_pre")
+within_mv      <- run_within_stratum(ccw_tbl_main2, "mech_vent0_inv")
+within_sofa14  <- run_within_stratum(ccw_tbl_main2, "sofa_ge14")
+
+subgroup_within <- bind_rows(within_lactate, within_ne,
+                             within_steroid, within_mv, within_sofa14)
+readr::write_csv(subgroup_within,
+                 file.path(OUT_DIR, "results_subgroup_within.csv"))
+print(subgroup_within)
+```
+
+# 14. Updated Table 1（Overall + Observed VP 0-3h / >3-6h + SMD + comorbidities + fluid）
+
+```{r table1-rev, message=FALSE}
+library(smd)
+
+t1_data <- pt_all_eligible %>%
+  filter(!is.na(t0_hr)) %>%
+  mutate(
+    obs_group_descriptive = case_when(
+      is.na(tvp_rel)              ~ "no_vp_within_6h",
+      tvp_rel <= 3                ~ "obs_0-3h",
+      tvp_rel >  3 & tvp_rel <= 6 ~ "obs_>3-6h",
+      tvp_rel >  6                ~ "obs_>6h",
+      TRUE                        ~ NA_character_
+    )
+  )
+
+t1_overall <- t1_data %>%
+  select(age, sex, bmi, wt0, map0, lact0, sofa0, crea0,
+         nee_0, mech_vent0_inv, ne_first,
+         starts_with("cc_"),
+         steroid_pre,
+         fluid_in_m24_t0, fluid_in_m6_t0,
+         fluid_bal_m24_t0, fluid_bal_m6_t0) %>%
+  tbl_summary(missing = "no") %>%
+  modify_header(label = "**Characteristic**")
+
+t1_by_obs <- t1_data %>%
+  filter(obs_group_descriptive %in% c("obs_0-3h", "obs_>3-6h")) %>%
+  mutate(obs_group_descriptive = factor(obs_group_descriptive,
+                                        levels = c("obs_0-3h", "obs_>3-6h"))) %>%
+  select(obs_group_descriptive,
+         age, sex, bmi, wt0, map0, lact0, sofa0, crea0,
+         nee_0, mech_vent0_inv, ne_first,
+         starts_with("cc_"),
+         steroid_pre,
+         fluid_in_m24_t0, fluid_in_m6_t0,
+         fluid_bal_m24_t0, fluid_bal_m6_t0) %>%
+  tbl_summary(by = obs_group_descriptive, missing = "no") %>%
+  add_difference(test = list(all_continuous() ~ "smd",
+                             all_categorical() ~ "smd"))
+
+t1_combined <- tbl_merge(list(t1_overall, t1_by_obs),
+                         tab_spanner = c("**Overall**", "**Observed VP timing**"))
+
+t1_combined %>% as_flex_table() %>%
+  flextable::save_as_docx(path = file.path(OUT_DIR, "table1_revICM.docx"))
+```
+
+# 15. First vasopressor distribution by database（R1 Major 1）
+
+```{r first-vaso}
+first_vaso_distribution <- pt_all_eligible %>%
+  filter(!is.na(t0_hr)) %>%
+  count(src, first_vaso) %>%
+  group_by(src) %>%
+  mutate(pct = 100 * n / sum(n)) %>%
+  ungroup() %>%
+  arrange(src, desc(n))
+
+readr::write_csv(first_vaso_distribution,
+                 file.path(OUT_DIR, "table_first_vasopressor.csv"))
+print(first_vaso_distribution)
+```
+
+# 16. Survivor vs non-survivor at 28 days（R1 Major 9）
+
+```{r survivor-nonsurvivor}
+sn_data <- pt_all_eligible %>%
+  filter(!is.na(t0_hr)) %>%
+  mutate(
+    surv28 = factor(if_else(coalesce(death28, FALSE), "non-survivor", "survivor"),
+                    levels = c("survivor", "non-survivor"))
+  )
+
+t_survnon <- sn_data %>%
+  select(surv28,
+         age, sex, bmi, wt0, map0, lact0, sofa0, crea0,
+         nee_0, ne_rate_0, ne_first, ne_at_t0, dobu_at_t0,
+         mech_vent0_inv,
+         starts_with("cc_"),
+         steroid_pre,
+         fluid_in_m24_t0, fluid_in_m6_t0,
+         fluid_bal_m24_t0, fluid_bal_m6_t0) %>%
+  tbl_summary(by = surv28, missing = "no") %>%
+  add_difference(test = list(all_continuous() ~ "smd",
+                             all_categorical() ~ "smd"))
+
+t_survnon %>% as_flex_table() %>%
+  flextable::save_as_docx(path = file.path(OUT_DIR, "table_survivor_nonsurvivor.docx"))
+```
+
+# 17. Vasopressin dose / interruption / new inotrope tables
+
+```{r vp-dose}
+vp_dose_by_timing <- pt_all_eligible %>%
+  filter(!is.na(tvp_rel), tvp_rel <= 6) %>%
+  mutate(timing = if_else(tvp_rel <= 3, "0-3h", ">3-6h")) %>%
+  group_by(timing) %>%
+  summarise(
+    n = n(),
+    init_med = median(vp_dose_init, na.rm = TRUE),
+    init_q1  = quantile(vp_dose_init, 0.25, na.rm = TRUE),
+    init_q3  = quantile(vp_dose_init, 0.75, na.rm = TRUE),
+    max24_med = median(vp_dose_max_24h, na.rm = TRUE),
+    cum24_med = median(vp_cum_24h, na.rm = TRUE),
+    pct_init_003 = 100 * mean(coalesce(vp_init_eq003, FALSE)),
+    pct_missing  = 100 * mean(coalesce(vp_dose_missing, FALSE)),
+    .groups = "drop"
+  )
+readr::write_csv(vp_dose_by_timing, file.path(OUT_DIR, "table_vp_dose.csv"))
+print(vp_dose_by_timing)
+```
+
+```{r vp-interrupt}
+vp_interrupt_by_timing <- pt_all_eligible %>%
+  filter(!is.na(tvp_rel)) %>%
+  mutate(timing = case_when(
+    tvp_rel <= 3                ~ "0-3h",
+    tvp_rel >  3 & tvp_rel <= 6 ~ ">3-6h",
+    tvp_rel >  6                ~ ">6h"
+  )) %>%
+  group_by(timing) %>%
+  summarise(
+    n = n(),
+    pct_premature_3h = 100 * mean(coalesce(interrupt_3h, FALSE)),
+    pct_sustained_6h = 100 * mean(coalesce(sustained_interrupt_6h, FALSE)),
+    pct_permanent_3h = 100 * mean(coalesce(permanent_disc_3h, FALSE)),
+    .groups = "drop"
+  )
+readr::write_csv(vp_interrupt_by_timing, file.path(OUT_DIR, "table_vp_interruption.csv"))
+print(vp_interrupt_by_timing)
+```
+
+```{r new-inotrope}
+new_inotrope_by_timing <- pt_all_eligible %>%
+  filter(!is.na(tvp_rel), tvp_rel <= 6, !coalesce(dobu_at_vp, FALSE)) %>%
+  mutate(timing = if_else(tvp_rel <= 3, "0-3h", ">3-6h")) %>%
+  group_by(timing) %>%
+  summarise(
+    n = n(),
+    pct_new_dobu_3h  = 100 * mean(coalesce(new_dobu_3h, FALSE)),
+    pct_new_dobu_6h  = 100 * mean(coalesce(new_dobu_6h, FALSE)),
+    pct_new_dobu_24h = 100 * mean(coalesce(new_dobu_24h, FALSE)),
+    pct_new_epi_24h  = 100 * mean(coalesce(new_epi_24h, FALSE)),
+    .groups = "drop"
+  )
+readr::write_csv(new_inotrope_by_timing, file.path(OUT_DIR, "table_new_inotrope_after_vp.csv"))
+print(new_inotrope_by_timing)
+```
+
+# 18. No-VP descriptive table（R1 Major 8）
+
+```{r no-vp-descriptive}
+no_vp_descriptive <- pt_all_eligible %>%
+  filter(!is.na(t0_hr)) %>%
+  mutate(timing = case_when(
+    is.na(tvp_rel)              ~ "never_vp",
+    tvp_rel <= 3                ~ "0-3h",
+    tvp_rel >  3 & tvp_rel <= 6 ~ ">3-6h",
+    tvp_rel >  6                ~ ">6h"
+  ),
+  timing = factor(timing, levels = c("0-3h", ">3-6h", ">6h", "never_vp"))) %>%
+  group_by(timing) %>%
+  summarise(
+    n             = n(),
+    age_med       = median(age, na.rm = TRUE),
+    sofa_med      = median(sofa0, na.rm = TRUE),
+    lact_med      = median(lact0, na.rm = TRUE),
+    nee_med       = median(nee_0, na.rm = TRUE),
+    mech_vent_pct = 100 * mean(coalesce(mech_vent0_inv, 0L), na.rm = TRUE),
+    crude_death28 = 100 * mean(coalesce(death28, FALSE), na.rm = TRUE),
+    .groups = "drop"
+  )
+readr::write_csv(no_vp_descriptive, file.path(OUT_DIR, "table_no_vp_descriptive.csv"))
+print(no_vp_descriptive)
+```
+
+# 19. Safety outcomes by observed timing（R1 Minor 14）
+
+```{r safety-by-timing}
+safety_by_timing <- pt_all_eligible %>%
+  filter(!is.na(t0_hr)) %>%
+  mutate(timing = case_when(
+    is.na(tvp_rel)              ~ "never_vp",
+    tvp_rel <= 3                ~ "0-3h",
+    tvp_rel >  3 & tvp_rel <= 6 ~ ">3-6h",
+    tvp_rel >  6                ~ ">6h"
+  )) %>%
+  group_by(timing) %>%
+  summarise(
+    n           = n(),
+    dvt_pct     = 100 * mean(coalesce(sf_dvt, FALSE)),
+    pe_pct      = 100 * mean(coalesce(sf_pe, FALSE)),
+    mesen_pct   = 100 * mean(coalesce(sf_mesenteric, FALSE)),
+    digital_pct = 100 * mean(coalesce(sf_digital, FALSE)),
+    .groups = "drop"
+  )
+readr::write_csv(safety_by_timing, file.path(OUT_DIR, "table_safety_outcomes.csv"))
+print(safety_by_timing)
+```
+
+# 20. Fluid summary table（R1 Minor 14）
+
+```{r fluid-diag}
+# 診断: fluid_summary_tbl が何を持っているか確認
+cat("fluid_summary_tbl rows:", nrow(fluid_summary_tbl), "\n")
+cat("fluid_summary_tbl 列:", paste(names(fluid_summary_tbl), collapse = ", "), "\n")
+if ("fluid_in_m24_t0" %in% names(fluid_summary_tbl)) {
+  cat("fluid_in_m24_t0 summary:\n")
+  print(summary(fluid_summary_tbl$fluid_in_m24_t0))
+  cat("fluid_bal_m24_t0 summary:\n")
+  print(summary(fluid_summary_tbl$fluid_bal_m24_t0))
+} else {
+  cat("⚠️ fluid_summary_tbl に fluid_in_m24_t0 列がない。前処理側の fluid_hourly.rds 読み込みが失敗している可能性。\n")
+}
+# pt_all_eligible に fluid 列が join されているか確認
+fluid_cols_in_pt <- intersect(
+  c("fluid_in_m24_t0", "fluid_in_m6_t0", "fluid_bal_m24_t0", "fluid_bal_m6_t0",
+    "fluid_in_m24_vp", "fluid_in_m6_vp", "fluid_in_p6_vp",
+    "fluid_bal_m24_vp", "fluid_bal_m6_vp", "fluid_bal_p6_vp"),
+  names(pt_all_eligible)
+)
+cat("pt_all_eligible にある fluid 列 (", length(fluid_cols_in_pt), "個):\n  ",
+    paste(fluid_cols_in_pt, collapse = ", "), "\n")
+
+if (length(fluid_cols_in_pt) > 0) {
+  cat("0-3h / >3-6h 群の fluid_in_m24_t0 中央値（非ゼロ率含む）:\n")
+  pt_all_eligible %>%
+    filter(!is.na(tvp_rel), tvp_rel <= 6) %>%
+    mutate(timing = if_else(tvp_rel <= 3, "0-3h", ">3-6h")) %>%
+    group_by(timing) %>%
+    summarise(
+      n = n(),
+      n_nonzero = sum(fluid_in_m24_t0 > 0, na.rm = TRUE),
+      n_na      = sum(is.na(fluid_in_m24_t0)),
+      med = median(fluid_in_m24_t0, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    print()
+}
+```
+
+```{r fluid-tbl}
+# fluid データがある（非ゼロ or NA でない）患者の数と分布を併記する
+fluid_q <- function(x) {
+  x <- x[!is.na(x) & x > 0]   # 非ゼロのみ
+  if (length(x) == 0) {
+    return(tibble(n_with_fluid = 0L, med = NA_real_, q1 = NA_real_, q3 = NA_real_,
+                  mean = NA_real_))
+  }
+  tibble(
+    n_with_fluid = length(x),
+    med  = median(x),
+    q1   = quantile(x, 0.25),
+    q3   = quantile(x, 0.75),
+    mean = mean(x)
+  )
+}
+
+# timing 群 × 各 fluid 指標について fluid_q() を計算する helper
+make_fluid_row <- function(df, timing_label) {
+  vars <- c("fluid_in_m24_t0", "fluid_in_m6_t0",
+            "fluid_bal_m24_t0", "fluid_bal_m6_t0",
+            "fluid_in_m24_vp", "fluid_in_m6_vp", "fluid_in_p6_vp",
+            "fluid_bal_m24_vp", "fluid_bal_m6_vp", "fluid_bal_p6_vp")
+  out <- map_dfr(vars, function(v) {
+    q <- fluid_q(df[[v]])
+    tibble(variable = v, !!!q)
+  })
+  out %>% mutate(timing = timing_label, n_group = nrow(df), .before = 1)
+}
+
+fluid_tbl <- pt_all_eligible %>%
+  filter(!is.na(t0_hr), !is.na(tvp_rel), tvp_rel <= 6) %>%
+  mutate(timing = if_else(tvp_rel <= 3, "0-3h", ">3-6h"))
+
+fluid_tbl_out <- bind_rows(
+  make_fluid_row(fluid_tbl %>% filter(timing == "0-3h"),  "0-3h"),
+  make_fluid_row(fluid_tbl %>% filter(timing == ">3-6h"), ">3-6h")
+) %>%
+  mutate(
+    pct_with_fluid = 100 * n_with_fluid / n_group,
+    summary_str = sprintf("%.0f (%.0f-%.0f) [mean %.0f, n=%d/%d (%.0f%%)]",
+                          med, q1, q3, mean, n_with_fluid, n_group, pct_with_fluid)
+  )
+
+readr::write_csv(fluid_tbl_out, file.path(OUT_DIR, "table_fluid_around_t0_vp.csv"))
+print(fluid_tbl_out %>% select(timing, n_group, variable, summary_str))
+```
+
+# 21. Steroid timing relative to VP（R1 Major 7）
+
+shinozaki orders-based の `steroid_at_t0`（t0以前 24h）と `steroid_0_6h`（t0 後 0-6h）から再構築する。
+
+```{r steroid-tbl}
+steroid_timing_tbl_out <- pt_all_eligible %>%
+  filter(!is.na(t0_hr)) %>%
+  mutate(
+    timing = case_when(
+      tvp_rel <= 3                ~ "0-3h",
+      tvp_rel >  3 & tvp_rel <= 6 ~ ">3-6h",
+      TRUE                        ~ NA_character_
+    ),
+    steroid_cat = case_when(
+      coalesce(steroid_at_t0, 0L) == 1                                     ~ "before",
+      coalesce(steroid_at_t0, 0L) == 0 & coalesce(steroid_0_6h, 0L) == 1   ~ "after_0_6h",
+      TRUE                                                                  ~ "none"
+    )
+  ) %>%
+  filter(!is.na(timing)) %>%
+  count(timing, steroid_cat) %>%
+  group_by(timing) %>%
+  mutate(pct = 100 * n / sum(n)) %>%
+  ungroup()
+readr::write_csv(steroid_timing_tbl_out,
+                 file.path(OUT_DIR, "table_steroid_timing.csv"))
+print(steroid_timing_tbl_out)
+```
+
+# 22. Figure 4: Subgroup forest plot
+
+```{r figure4-forest, fig.width=10, fig.height=8}
+forest_data <- bind_rows(
+  within_lactate %>% mutate(group = "Lactate at time zero",
+                            stratum_label = recode(.stratum,
+                                                   lt2 = "<2 mmol/L",
+                                                   `2to4` = "2-<4 mmol/L",
+                                                   ge4 = "≥4 mmol/L")),
+  within_ne      %>% mutate(group = "NE-equivalent dose",
+                            stratum_label = if_else(.stratum == "1",
+                                                    "≥0.30 µg/kg/min",
+                                                    "<0.30 µg/kg/min")),
+  within_mv      %>% mutate(group = "Invasive mechanical ventilation",
+                            stratum_label = if_else(.stratum == "1", "Yes", "No")),
+  within_sofa14  %>% mutate(group = "SOFA score",
+                            stratum_label = if_else(.stratum == "1",
+                                                    "≥14", "<14")),
+  within_steroid %>% mutate(group = "Baseline steroid (orders-based)",
+                            stratum_label = if_else(.stratum == "1",
+                                                    "Yes", "No"))
+) %>%
+  mutate(group = factor(group, levels = c(
+    "Lactate at time zero", "NE-equivalent dose",
+    "Invasive mechanical ventilation", "SOFA score",
+    "Baseline steroid (orders-based)"
+  )))
+
+p_forest <- forest_data %>%
+  ggplot(aes(x = HR, y = stratum_label)) +
+  geom_vline(xintercept = 1, lty = 2, color = "grey50") +
+  geom_pointrange(aes(xmin = lower, xmax = upper),
+                  color = COL_ULTRA, size = 0.6) +
+  geom_text(aes(label = sprintf("%.2f (%.2f-%.2f)", HR, lower, upper)),
+            hjust = -0.15, vjust = -0.6, size = 3) +
+  facet_grid(group ~ ., scales = "free_y", space = "free_y", switch = "y") +
+  scale_x_log10(breaks = c(0.5, 0.7, 1, 1.5, 2), limits = c(0.5, 2)) +
+  labs(x = "Hazard ratio (ultra-early vs early)", y = NULL) +
+  theme_minimal() +
+  theme(strip.text.y.left = element_text(angle = 0),
+        strip.placement   = "outside",
+        panel.grid.major.y = element_blank())
+
+ggsave(file.path(OUT_DIR, "figure4_subgroup_forest.pdf"),
+       p_forest, width = 10, height = 8)
+ggsave(file.path(OUT_DIR, "figure4_subgroup_forest.png"),
+       p_forest, width = 10, height = 8, dpi = 300)
+print(p_forest)
+```
+
+# 23. CCW diagnostics
+
+```{r ccw-diagnostics}
+uncensored_per_hour_primary <- w_grace_main %>%
+  group_by(arm, t) %>%
+  summarise(n_uncensored = n(),
+            sum_w        = sum(w_ipcw, na.rm = TRUE), .groups = "drop") %>%
+  mutate(model = "Main (comorbidity-adjusted)")
+
+uncensored_per_hour_bl <- w_grace_bl %>%
+  group_by(arm, t) %>%
+  summarise(n_uncensored = n(),
+            sum_w        = sum(w_ipcw, na.rm = TRUE), .groups = "drop") %>%
+  mutate(model = "Baseline-only")
+
+uncensored_combined <- bind_rows(uncensored_per_hour_primary, uncensored_per_hour_bl)
+readr::write_csv(uncensored_combined, file.path(OUT_DIR, "ccw_uncensored_per_hour.csv"))
+
+weight_dist_primary <- ccw_tbl_main %>% transmute(arm, weight,
+                                                  model = "Main (comorbidity-adjusted)")
+weight_dist_bl      <- ccw_tbl_bl   %>% transmute(arm, weight,
+                                                  model = "Baseline-only")
+weight_dist <- bind_rows(weight_dist_primary, weight_dist_bl)
+
+p_w <- weight_dist %>%
+  ggplot(aes(x = weight, fill = arm, color = arm)) +
+  geom_density(alpha = 0.35) +
+  facet_wrap(~ model, ncol = 1, scales = "free_y") +
+  scale_x_log10() +
+  scale_fill_manual(values = c(early = COL_EARLY, ultra = COL_ULTRA)) +
+  scale_color_manual(values = c(early = COL_EARLY, ultra = COL_ULTRA)) +
+  labs(x = "Final IPC weight (log scale)", y = "Density") +
+  theme_minimal()
+
+ggsave(file.path(OUT_DIR, "ccw_weight_distribution.pdf"),
+       p_w, width = 8, height = 6)
+print(p_w)
+```
+
+# 24. Lactate trajectory after VP（R1 Major 3）
+
+```{r lactate-trajectory}
+lactate_after_vp <- ts_imputed %>%
+  inner_join(pt_all_eligible %>% select(uid, t0_hr, tvp_rel) %>%
+               filter(!is.na(tvp_rel)),
+             by = "uid") %>%
+  mutate(
+    vp_abs_hr = t0_hr + tvp_rel,
+    t_rel_vp  = time_hr - vp_abs_hr,
+    timing    = if_else(tvp_rel <= 3, "0-3h", ">3-6h")
+  ) %>%
+  filter(!is.na(lact), t_rel_vp >= -2, t_rel_vp <= 24) %>%
+  mutate(t_bin = cut(t_rel_vp,
+                     breaks = c(-2, 0, 6, 12, 24),
+                     labels = c("baseline", "0-6h", "6-12h", "12-24h"),
+                     include.lowest = TRUE)) %>%
+  filter(!is.na(t_bin)) %>%
+  mutate(t_bin = droplevels(t_bin)) %>%
+  group_by(timing, t_bin) %>%
+  summarise(
+    n        = n(),
+    lact_med = median(lact, na.rm = TRUE),
+    lact_q1  = quantile(lact, 0.25, na.rm = TRUE),
+    lact_q3  = quantile(lact, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+readr::write_csv(lactate_after_vp,
+                 file.path(OUT_DIR, "lactate_trajectory_after_vp.csv"))
+
+p_lact <- lactate_after_vp %>%
+  ggplot(aes(x = t_bin, y = lact_med, color = timing, group = timing)) +
+  geom_line(size = 1) + geom_point(size = 3) +
+  geom_errorbar(aes(ymin = lact_q1, ymax = lact_q3), width = 0.15) +
+  scale_color_manual(values = c(`0-3h` = COL_ULTRA, `>3-6h` = COL_EARLY)) +
+  scale_x_discrete(na.translate = FALSE) +
+  labs(x = "Time relative to vasopressin initiation",
+       y = "Lactate (mmol/L)", color = "Observed VP timing") +
+  theme_minimal()
+ggsave(file.path(OUT_DIR, "lactate_trajectory_after_vp.pdf"),
+       p_lact, width = 8, height = 5)
+print(p_lact)
+```
+
+# 25. Risk difference / RMST（bootstrap 500 iterations）
+
+```{r rd-rmst, eval = TRUE}
+weighted_km <- function(dat, cap_val) {
+  d <- dat %>%
+    mutate(w = pmax(P_CLIP, pmin(weight, cap_val)),
+           arm = factor(arm, levels = c("early", "ultra")))
+  out <- map_dfr(c("early", "ultra"), function(a) {
+    s <- d %>% filter(arm == a)
+    fit <- survfit(Surv(tstart, tstop, event) ~ 1, data = s, weights = s$w)
+    tibble(arm = a, time = c(0, fit$time),
+           cuminc = c(0, 1 - fit$surv))
+  })
+  out
+}
+
+get_riskdiff <- function(km_df) {
+  r_u <- km_df %>% filter(arm == "ultra") %>%
+    slice_tail(n = 1) %>% pull(cuminc)
+  r_e <- km_df %>% filter(arm == "early") %>%
+    slice_tail(n = 1) %>% pull(cuminc)
+  list(r_u = r_u, r_e = r_e, rd = r_u - r_e)
+}
+
+get_rmst_diff <- function(km_df, t_max = DAY28_HR) {
+  rmst_arm <- function(df) {
+    df <- df %>% arrange(time) %>% filter(time <= t_max)
+    surv <- 1 - df$cuminc
+    times <- df$time
+    sum(diff(times) * (head(surv, -1) + tail(surv, -1)) / 2) / 24
+  }
+  r_u <- rmst_arm(km_df %>% filter(arm == "ultra"))
+  r_e <- rmst_arm(km_df %>% filter(arm == "early"))
+  r_u - r_e
+}
+
+km_main <- weighted_km(ccw_tbl_main, caps_main$cap99)
+pt_rd   <- get_riskdiff(km_main)
+pt_rmst <- get_rmst_diff(km_main)
+
+cat("Primary 28-d risk: ultra =", round(pt_rd$r_u, 4),
+    "  early =", round(pt_rd$r_e, 4),
+    "  RD =", round(pt_rd$rd, 4), "\n")
+cat("Primary RMST diff =", round(pt_rmst, 3), "days\n")
+
+boot_rd_rmst <- function(ccw_tbl, cap_val, B = 100) {
+  uids <- unique(ccw_tbl$uid)
+  out <- map_dfr(1:B, function(b) {
+    s <- sample(uids, length(uids), replace = TRUE)
+    bdat <- tibble(uid = s) %>%
+      inner_join(ccw_tbl, by = "uid", relationship = "many-to-many")
+    km_b   <- weighted_km(bdat, cap_val)
+    rd_b   <- get_riskdiff(km_b)$rd
+    rmst_b <- get_rmst_diff(km_b)
+    tibble(b = b, rd = rd_b, rmst = rmst_b)
+  })
+  out
+}
+
+if (B_BOOT > 0) {
+  set.seed(SEED)
+  boot_out <- boot_rd_rmst(ccw_tbl_main, caps_main$cap99, B = B_BOOT)
+  ci_rd   <- quantile(boot_out$rd,   c(0.025, 0.975), na.rm = TRUE)
+  ci_rmst <- quantile(boot_out$rmst, c(0.025, 0.975), na.rm = TRUE)
+  rd_rmst_results <- tibble(
+    metric = c("28-d risk (ultra)", "28-d risk (early)",
+               "RD (pp)", "RMST diff (days)"),
+    estimate = c(pt_rd$r_u, pt_rd$r_e, pt_rd$rd * 100, pt_rmst),
+    lower    = c(NA, NA, ci_rd[1] * 100, ci_rmst[1]),
+    upper    = c(NA, NA, ci_rd[2] * 100, ci_rmst[2])
+  )
+  readr::write_csv(rd_rmst_results, file.path(OUT_DIR, "results_primary_rd_rmst.csv"))
+  print(rd_rmst_results)
+}
+```
+
+# 26. Updated Figure 2: weighted cumulative incidence
+
+```{r fig2-cuminc, fig.width=10, fig.height=6}
+p_cuminc <- km_main %>%
+  ggplot(aes(x = time / 24, y = cuminc * 100,
+             color = arm, linetype = arm)) +
+  geom_step(size = 1) +
+  scale_color_manual(values = c(ultra = COL_ULTRA, early = COL_EARLY),
+                     labels = c("0-3 h (ultra-early)", ">3-6 h (early)"),
+                     breaks = c("ultra", "early")) +
+  scale_linetype_manual(values = c(ultra = "solid", early = "dashed"),
+                        labels = c("0-3 h (ultra-early)", ">3-6 h (early)"),
+                        breaks = c("ultra", "early")) +
+  scale_x_continuous(breaks = seq(0, 28, 7)) +
+  scale_y_continuous(limits = c(0, 50), breaks = seq(0, 50, 10)) +
+  labs(x = "Days after time zero", y = "Cumulative incidence of death (%)",
+       color = NULL, linetype = NULL) +
+  theme_minimal() +
+  theme(legend.position = c(0.8, 0.2))
+
+ggsave(file.path(OUT_DIR, "figure2_cuminc_revICM.pdf"),
+       p_cuminc, width = 10, height = 6)
+print(p_cuminc)
+```
+
+# 27. Response letter 用数値サマリー
+
+```{r summary-for-response}
+final_summary <- list(
+  N_eligible           = nrow(pt_all_eligible),
+  N_mimic              = sum(pt_all_eligible$src == "miiv"),
+  N_eicu               = sum(pt_all_eligible$src == "eicu"),
+  N_adherent_ultra     = sum(pt_all_eligible$tvp_rel <= 3, na.rm = TRUE),
+  N_adherent_early     = sum(pt_all_eligible$tvp_rel > 3 & pt_all_eligible$tvp_rel <= 6,
+                             na.rm = TRUE),
+  N_never_vp_within_6h = sum(is.na(pt_all_eligible$tvp_rel) |
+                              pt_all_eligible$tvp_rel > 6),
+  crude_death28        = mean(pt_all_eligible$death28, na.rm = TRUE),
+  original_HR          = res_original$HR,
+  original_HR_low      = res_original$lower,
+  original_HR_high     = res_original$upper,
+  main_HR_99           = res_primary_99$HR,
+  main_HR_99_low       = res_primary_99$lower,
+  main_HR_99_high      = res_primary_99$upper,
+  baseline_only_HR     = res_baseline_only$HR,
+  baseline_only_low    = res_baseline_only$lower,
+  baseline_only_high   = res_baseline_only$upper
+)
+
+tibble(metric = names(final_summary), value = as.character(final_summary)) %>%
+  readr::write_csv(file.path(OUT_DIR, "summary_for_response.csv"))
+print(final_summary)
+```
+
+---
+
+# 28. 出力ファイル一覧（response letter 数値参照用）
+
+- `results_primary.csv` … Original + Main (99% / 95%)
+- `results_sensitivity_all.csv` … 全 sensitivity（baseline-only / NE-restricted / inotrope）
+- `results_ne_sensitivity.csv` / `results_inotrope_sensitivity.csv`
+- `results_secondary_finegray.csv` … Fine-Gray secondary outcomes
+- `results_subgroup_interaction.csv` / `results_subgroup_within.csv`
+- `results_primary_rd_rmst.csv` … RD / RMST 95% CI
+- `summary_for_response.csv` … 主要数値サマリー
+- `table1_revICM.docx` … 改訂 Table 1
+- `table_first_vasopressor.csv`, `table_survivor_nonsurvivor.docx`,
+  `table_vp_dose.csv`, `table_vp_interruption.csv`,
+  `table_new_inotrope_after_vp.csv`, `table_no_vp_descriptive.csv`,
+  `table_safety_outcomes.csv`, `table_fluid_around_t0_vp.csv`,
+  `table_steroid_timing.csv`
+- `figure2_cuminc_revICM.pdf`, `figure4_subgroup_forest.pdf` / `.png`
+- `ccw_weight_distribution.pdf`, `ccw_uncensored_per_hour.csv`
+- `lactate_trajectory_after_vp.pdf` / `.csv`
